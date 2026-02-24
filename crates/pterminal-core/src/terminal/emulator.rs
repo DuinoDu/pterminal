@@ -29,9 +29,15 @@ impl EventListener for Listener {
     }
 }
 
+/// Shared terminal state protected by Mutex
+struct TermInner {
+    term: Term<Listener>,
+    processor: ansi::Processor<StdSyncHandler>,
+}
+
 /// Terminal emulator wrapping alacritty_terminal
 pub struct TerminalEmulator {
-    term: Arc<Mutex<Term<Listener>>>,
+    inner: Arc<Mutex<TermInner>>,
     event_rx: std::sync::mpsc::Receiver<TermEvent>,
 }
 
@@ -41,18 +47,19 @@ impl TerminalEmulator {
         let listener = Listener { sender: tx };
         let size = TermSize::new(cols as usize, rows as usize);
         let term = Term::new(term::Config::default(), &size, listener);
+        let processor = ansi::Processor::new();
 
         Self {
-            term: Arc::new(Mutex::new(term)),
+            inner: Arc::new(Mutex::new(TermInner { term, processor })),
             event_rx: rx,
         }
     }
 
-    /// Process raw bytes from PTY output
+    /// Process raw bytes from PTY output (persistent VTE parser state)
     pub fn process(&self, data: &[u8]) {
-        let mut term = self.term.lock().unwrap();
-        let mut processor: ansi::Processor<StdSyncHandler> = ansi::Processor::new();
-        processor.advance(&mut *term, data);
+        let mut inner = self.inner.lock().unwrap();
+        let TermInner { ref mut term, ref mut processor } = *inner;
+        processor.advance(term, data);
     }
 
     /// Drain pending events
@@ -66,28 +73,28 @@ impl TerminalEmulator {
 
     /// Get current dimensions
     pub fn size(&self) -> (u16, u16) {
-        let term = self.term.lock().unwrap();
-        (term.columns() as u16, term.screen_lines() as u16)
+        let inner = self.inner.lock().unwrap();
+        (inner.term.columns() as u16, inner.term.screen_lines() as u16)
     }
 
     /// Resize the terminal
     pub fn resize(&self, cols: u16, rows: u16) {
-        let mut term = self.term.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let size = TermSize::new(cols as usize, rows as usize);
-        term.resize(size);
+        inner.term.resize(size);
     }
 
     /// Clone the inner Arc for sharing with PTY reader thread
     pub fn clone_inner(&self) -> TerminalEmulatorHandle {
         TerminalEmulatorHandle {
-            term: Arc::clone(&self.term),
+            inner: Arc::clone(&self.inner),
         }
     }
 
     /// Get cursor position as (col, row)
     pub fn cursor_position(&self) -> (u16, u16) {
-        let term = self.term.lock().unwrap();
-        let cursor = term.grid().cursor.point;
+        let inner = self.inner.lock().unwrap();
+        let cursor = inner.term.grid().cursor.point;
         (cursor.column.0 as u16, cursor.line.0 as u16)
     }
 
@@ -96,8 +103,8 @@ impl TerminalEmulator {
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::cell::Flags;
 
-        let term = self.term.lock().unwrap();
-        let grid = term.grid();
+        let inner = self.inner.lock().unwrap();
+        let grid = inner.term.grid();
         let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
         let mut lines = Vec::with_capacity(num_lines);
@@ -132,14 +139,14 @@ impl TerminalEmulator {
 
 /// Handle for sharing emulator with PTY reader thread
 pub struct TerminalEmulatorHandle {
-    term: Arc<Mutex<Term<Listener>>>,
+    inner: Arc<Mutex<TermInner>>,
 }
 
 impl TerminalEmulatorHandle {
     pub fn process(&self, data: &[u8]) {
-        let mut term = self.term.lock().unwrap();
-        let mut processor: ansi::Processor<StdSyncHandler> = ansi::Processor::new();
-        processor.advance(&mut *term, data);
+        let mut inner = self.inner.lock().unwrap();
+        let TermInner { ref mut term, ref mut processor } = *inner;
+        processor.advance(term, data);
     }
 }
 

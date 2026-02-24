@@ -60,9 +60,6 @@ struct RunningState {
     renderer: Renderer,
     workspace_mgr: WorkspaceManager,
     pane_states: HashMap<PaneId, PaneState>,
-    cursor_visible: bool,
-    last_blink: Instant,
-    blink_interval: Duration,
     scale_factor: f64,
     modifiers: ModifiersState,
     clipboard: Option<Clipboard>,
@@ -262,7 +259,6 @@ impl ApplicationHandler for AppHandler {
         let mut pane_states = HashMap::new();
         pane_states.insert(initial_pane_id, ps);
 
-        let blink_ms = self.app.config.cursor.blink_interval_ms;
         let clipboard = Clipboard::new().ok();
         info!(cols, rows, scale_factor, "Terminal started");
 
@@ -271,9 +267,6 @@ impl ApplicationHandler for AppHandler {
             renderer,
             workspace_mgr,
             pane_states,
-            cursor_visible: true,
-            last_blink: Instant::now(),
-            blink_interval: Duration::from_millis(blink_ms),
             scale_factor,
             modifiers: ModifiersState::empty(),
             clipboard,
@@ -535,8 +528,7 @@ impl ApplicationHandler for AppHandler {
                     if let Some(ps) = state.pane_states.get(&active) {
                         let _ = ps.pty.write(&bytes);
                     }
-                    state.cursor_visible = true;
-                    state.last_blink = Instant::now();
+                    state.window.request_redraw();
                 }
             }
 
@@ -556,12 +548,10 @@ impl ApplicationHandler for AppHandler {
                     let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale);
 
                     if let Some(ps) = state.pane_states.get_mut(pane_id) {
-                        let is_active = *pane_id == active_pane;
-                        let show_cursor = is_active && state.cursor_visible;
+                        let show_cursor = *pane_id == active_pane;
                         let content_dirty = ps.dirty.load(Ordering::Acquire);
-                        let cursor_changed = is_active && ps.last_cursor_visible != show_cursor;
+                        let cursor_changed = ps.last_cursor_visible != show_cursor;
 
-                        // Only extract grid + rebuild spans when content or cursor changed
                         if content_dirty || cursor_changed {
                             let grid = ps.emulator.extract_grid(theme);
                             let cursor_pos = ps.emulator.cursor_position();
@@ -598,40 +588,19 @@ impl ApplicationHandler for AppHandler {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(state) = &mut self.app.state {
-            // Poll events for all visible panes only
+        if let Some(state) = &self.app.state {
             let active_panes = state.workspace_mgr.active_workspace().pane_ids();
-            for pid in &active_panes {
-                if let Some(ps) = state.pane_states.get(pid) {
-                    let _ = ps.emulator.poll_events();
-                }
-            }
-
-            // Cursor blink — don't set pane dirty, just request_redraw
-            let now = Instant::now();
-            let mut need_redraw = false;
-            if self.app.config.cursor.blink
-                && now.duration_since(state.last_blink) >= state.blink_interval
-            {
-                state.cursor_visible = !state.cursor_visible;
-                state.last_blink = now;
-                need_redraw = true; // cursor changed, need redraw but not content rebuild
-            }
-
-            // Check if any visible pane has new content
-            if !need_redraw {
-                need_redraw = active_panes.iter().any(|pid| {
-                    state.pane_states.get(pid).map_or(false, |ps| ps.dirty.load(Ordering::Acquire))
-                });
-            }
-
-            if need_redraw {
+            let any_dirty = active_panes.iter().any(|pid| {
+                state.pane_states.get(pid).map_or(false, |ps| ps.dirty.load(Ordering::Relaxed))
+            });
+            if any_dirty {
                 state.window.request_redraw();
             }
-
-            let next_blink = state.last_blink + state.blink_interval;
-            let next_wake = next_blink.min(now + Duration::from_millis(100));
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next_wake));
+            // Short safety-net timeout: ensures rendering even if cross-thread
+            // request_redraw doesn't immediately wake the macOS run loop.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(4),
+            ));
         }
     }
 }
