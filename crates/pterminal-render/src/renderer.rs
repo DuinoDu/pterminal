@@ -69,7 +69,11 @@ impl Renderer {
             width,
             height,
             present_mode,
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode: if surface_caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+                wgpu::CompositeAlphaMode::Opaque
+            } else {
+                surface_caps.alpha_modes[0]
+            },
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
         };
