@@ -69,10 +69,26 @@ struct RunningState {
     last_mouse_pos: (f64, f64), // logical pixels
     // IME state — when true, character input comes via Ime::Commit
     ime_active: bool,
+    // Context menu state
+    context_menu: Option<ContextMenu>,
     // Performance monitoring
     frame_count: u64,
     fps_timer: Instant,
     debug_timing: bool,
+}
+
+/// Right-click context menu
+struct ContextMenu {
+    x: f32,         // physical pixels
+    y: f32,
+    items: Vec<ContextMenuItem>,
+    has_selection: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ContextMenuItem {
+    Copy,
+    Paste,
 }
 
 impl App {
@@ -258,6 +274,30 @@ impl AppHandler {
             }
         }
     }
+
+    /// Hit test context menu — returns the clicked item, or None if outside
+    fn context_menu_hit_test(
+        menu: &ContextMenu,
+        phys_x: f32,
+        phys_y: f32,
+        scale: f32,
+    ) -> Option<ContextMenuItem> {
+        let item_h = 28.0 * scale;
+        let menu_w = 120.0 * scale;
+        let menu_x = menu.x;
+        let menu_y = menu.y;
+
+        if phys_x < menu_x || phys_x > menu_x + menu_w {
+            return None;
+        }
+        for (i, item) in menu.items.iter().enumerate() {
+            let iy = menu_y + i as f32 * item_h;
+            if phys_y >= iy && phys_y < iy + item_h {
+                return Some(*item);
+            }
+        }
+        None
+    }
 }
 
 impl ApplicationHandler for AppHandler {
@@ -312,6 +352,7 @@ impl ApplicationHandler for AppHandler {
             mouse_pressed: false,
             last_mouse_pos: (0.0, 0.0),
             ime_active: false,
+            context_menu: None,
             frame_count: 0,
             fps_timer: Instant::now(),
             debug_timing,
@@ -399,12 +440,84 @@ impl ApplicationHandler for AppHandler {
 
             // Mouse events for selection
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
+                let scale = state.scale_factor as f32;
+                let phys_x = state.last_mouse_pos.0 as f32 * scale;
+                let phys_y = state.last_mouse_pos.1 as f32 * scale;
+
+                // Check context menu click
+                if let Some(ref menu) = state.context_menu {
+                    if btn_state == ElementState::Pressed {
+                        let item = Self::context_menu_hit_test(menu, phys_x, phys_y, scale);
+                        if let Some(action) = item {
+                            match action {
+                                ContextMenuItem::Copy => {
+                                    if let Some(text) = Self::get_selected_text(state, &self.app.theme) {
+                                        if let Some(clip) = &mut state.clipboard {
+                                            let _ = clip.set_text(text);
+                                        }
+                                    }
+                                }
+                                ContextMenuItem::Paste => {
+                                    if let Some(clip) = &mut state.clipboard {
+                                        if let Ok(text) = clip.get_text() {
+                                            let active = state.workspace_mgr.active_workspace().active_pane();
+                                            if let Some(ps) = state.pane_states.get(&active) {
+                                                let _ = ps.pty.write(text.as_bytes());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        state.context_menu = None;
+                        state.window.request_redraw();
+                        return;
+                    }
+                }
+
+                // Check tab bar click
+                let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
+                if tab_bar_h > 0.0 && phys_y < tab_bar_h && btn_state == ElementState::Pressed {
+                    let tab_count = state.workspace_mgr.workspace_count();
+                    if tab_count > 1 {
+                        let tab_width = state.renderer.width() as f32 / tab_count as f32;
+                        let close_btn_w = 20.0 * scale;
+                        let clicked_tab = (phys_x / tab_width) as usize;
+                        let tab_right_edge = (clicked_tab + 1) as f32 * tab_width;
+
+                        if phys_x > tab_right_edge - close_btn_w {
+                            // Close button hit — close this tab
+                            if tab_count > 1 {
+                                // Switch to tab first, then close
+                                state.workspace_mgr.select_workspace(clicked_tab);
+                                let ws = state.workspace_mgr.active_workspace();
+                                let pane_ids = ws.pane_ids();
+                                let ws_id = ws.id;
+                                for pid in &pane_ids {
+                                    state.pane_states.remove(pid);
+                                }
+                                state.workspace_mgr.close_workspace(ws_id);
+                                Self::update_title(state);
+                            }
+                        } else {
+                            // Switch to clicked tab
+                            state.workspace_mgr.select_workspace(clicked_tab);
+                            Self::update_title(state);
+                        }
+                        // Mark all panes dirty for redraw
+                        for ps in state.pane_states.values() {
+                            ps.dirty.store(true, Ordering::Relaxed);
+                        }
+                        state.window.request_redraw();
+                        return;
+                    }
+                }
+
                 match btn_state {
                     ElementState::Pressed => {
                         state.mouse_pressed = true;
                         let cell = Self::pixel_to_cell(state);
                         state.selection = Some(Selection { start: cell, end: cell });
-                        // Mark active pane dirty
                         let active = state.workspace_mgr.active_workspace().active_pane();
                         if let Some(ps) = state.pane_states.get(&active) {
                             ps.dirty.store(true, Ordering::Relaxed);
@@ -422,6 +535,28 @@ impl ApplicationHandler for AppHandler {
                             }
                         }
                     }
+                }
+            }
+
+            // Right-click context menu
+            WindowEvent::MouseInput { state: btn_state, button: MouseButton::Right, .. } => {
+                if btn_state == ElementState::Pressed {
+                    let scale = state.scale_factor as f32;
+                    let phys_x = state.last_mouse_pos.0 as f32 * scale;
+                    let phys_y = state.last_mouse_pos.1 as f32 * scale;
+                    let has_selection = state.selection.is_some();
+                    let mut items = Vec::new();
+                    if has_selection {
+                        items.push(ContextMenuItem::Copy);
+                    }
+                    items.push(ContextMenuItem::Paste);
+                    state.context_menu = Some(ContextMenu {
+                        x: phys_x,
+                        y: phys_y,
+                        items,
+                        has_selection,
+                    });
+                    state.window.request_redraw();
                 }
             }
 
@@ -644,9 +779,9 @@ impl ApplicationHandler for AppHandler {
                 let tab_count = state.workspace_mgr.workspace_count();
                 let active_idx = state.workspace_mgr.active_index();
                 let tabs: Vec<(String, bool)> = (0..tab_count)
-                    .map(|i| (format!("Tab {}", i + 1), i == active_idx))
+                    .map(|i| (format!("Tab {}  ✕", i + 1), i == active_idx))
                     .collect();
-                let tab_bar_bg = RgbColor::new(0x1e, 0x1f, 0x29); // darker than terminal bg
+                let tab_bar_bg = RgbColor::new(0x1e, 0x1f, 0x29);
                 let tab_active_bg = theme.colors.background;
                 let tab_fg = RgbColor::new(0x88, 0x88, 0x88);
                 let tab_active_fg = theme.colors.foreground;
@@ -654,6 +789,19 @@ impl ApplicationHandler for AppHandler {
                     &tabs, tab_bar_bg, tab_active_bg, tab_fg, tab_active_fg,
                 );
                 let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
+
+                // Update context menu overlay
+                if let Some(ref menu) = state.context_menu {
+                    let items: Vec<(&str, bool)> = menu.items.iter().map(|item| {
+                        match item {
+                            ContextMenuItem::Copy => ("Copy", true),
+                            ContextMenuItem::Paste => ("Paste", true),
+                        }
+                    }).collect();
+                    state.renderer.text_renderer.set_context_menu(menu.x, menu.y, &items);
+                } else {
+                    state.renderer.text_renderer.clear_context_menu();
+                }
 
                 let layout = state.workspace_mgr.active_workspace().split_tree.layout();
                 let active_pane = state.workspace_mgr.active_workspace().active_pane();
@@ -692,6 +840,11 @@ impl ApplicationHandler for AppHandler {
                     pane_rects.push((*pane_id, px_rect));
                 }
                 let grid_dur = t_grid.elapsed();
+
+                // Context menu or tab bar changes also require GPU update
+                if state.context_menu.is_some() || tab_bar_h > 0.0 {
+                    any_updated = true;
+                }
 
                 // Skip GPU work when nothing changed
                 if any_updated {

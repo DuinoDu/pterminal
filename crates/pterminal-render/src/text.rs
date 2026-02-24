@@ -65,6 +65,8 @@ pub struct TextRenderer {
     line_height: f32,
     /// Tab bar label buffer (None = no tab bar)
     tab_bar: Option<TabBar>,
+    /// Context menu overlay (None = hidden)
+    context_menu: Option<ContextMenuOverlay>,
 }
 
 /// Tab bar state
@@ -73,6 +75,16 @@ struct TabBar {
     height: f32, // physical pixels
     bg_rects: Vec<crate::bg::BgRect>,
     content_hash: u64,
+}
+
+/// Context menu overlay
+struct ContextMenuOverlay {
+    buffer: Buffer,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    bg_rects: Vec<crate::bg::BgRect>,
 }
 
 impl TextRenderer {
@@ -116,6 +128,7 @@ impl TextRenderer {
             font_size: scaled_font_size,
             line_height: scaled_line_height,
             tab_bar: None,
+            context_menu: None,
         }
     }
 
@@ -310,6 +323,24 @@ impl TextRenderer {
             }
         }
 
+        // Context menu text (rendered on top)
+        if let Some(ref cm) = self.context_menu {
+            text_areas.push(TextArea {
+                buffer: &cm.buffer,
+                left: cm.x,
+                top: cm.y,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: cm.x as i32,
+                    top: cm.y as i32,
+                    right: (cm.x + cm.w) as i32,
+                    bottom: (cm.y + cm.h) as i32,
+                },
+                default_color: default_glyphon_color,
+                custom_glyphs: &[],
+            });
+        }
+
         let _ = self.glyphon_renderer.prepare(
             device,
             queue,
@@ -366,6 +397,12 @@ impl TextRenderer {
                 }
             }
         }
+
+        // Context menu bg rects (on top of everything)
+        if let Some(ref cm) = self.context_menu {
+            rects.extend_from_slice(&cm.bg_rects);
+        }
+
         rects
     }
 
@@ -483,9 +520,85 @@ impl TextRenderer {
             content_hash: hash,
         });
     }
-}
 
-/// Hash a single terminal line for change detection
+    /// Show context menu at given position with given items
+    pub fn set_context_menu(
+        &mut self,
+        x: f32,
+        y: f32,
+        items: &[(&str, bool)], // (label, enabled)
+    ) {
+        let scale = self.scale_factor;
+        let item_h = 28.0 * scale;
+        let menu_w = 120.0 * scale;
+        let menu_h = items.len() as f32 * item_h;
+        let pad = 6.0 * scale;
+        let font_size = self.font_size * 0.75;
+
+        // Clamp to screen
+        let mx = x.min(self.width as f32 - menu_w - pad);
+        let my = y.min(self.height as f32 - menu_h - pad);
+
+        // Background rect (dark panel)
+        let mut bg_rects = vec![crate::bg::BgRect {
+            x: mx,
+            y: my,
+            w: menu_w,
+            h: menu_h,
+            color: [0.15, 0.15, 0.18, 1.0],
+        }];
+
+        // Hover areas (items)
+        for i in 0..items.len() {
+            bg_rects.push(crate::bg::BgRect {
+                x: mx,
+                y: my + i as f32 * item_h,
+                w: menu_w,
+                h: item_h,
+                color: [0.15, 0.15, 0.18, 1.0],
+            });
+        }
+
+        // Text buffer
+        let metrics = Metrics::new(font_size, item_h);
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        buffer.set_size(&mut self.font_system, Some(menu_w), Some(menu_h));
+
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        for (i, (label, _enabled)) in items.iter().enumerate() {
+            if i > 0 {
+                text.push('\n');
+            }
+            let start = text.len();
+            text.push_str(&format!("  {}", label));
+            spans.push((start, text.len()));
+        }
+
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        let fg_color = Color::rgb(0xee, 0xee, 0xee);
+        let rich: Vec<(&str, Attrs)> = spans
+            .iter()
+            .map(|(s, e)| (&text[*s..*e], default_attrs.color(fg_color)))
+            .collect();
+        buffer.set_rich_text(&mut self.font_system, rich, default_attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+
+        self.context_menu = Some(ContextMenuOverlay {
+            buffer,
+            x: mx,
+            y: my,
+            w: menu_w,
+            h: menu_h,
+            bg_rects,
+        });
+    }
+
+    /// Hide context menu
+    pub fn clear_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+}
 fn hash_line(line: &GridLine) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
