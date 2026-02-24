@@ -67,6 +67,8 @@ struct RunningState {
     selection: Option<Selection>,
     mouse_pressed: bool,
     last_mouse_pos: (f64, f64), // logical pixels
+    // IME state — when true, character input comes via Ime::Commit
+    ime_active: bool,
     // Performance monitoring
     frame_count: u64,
     fps_timer: Instant,
@@ -279,6 +281,7 @@ impl ApplicationHandler for AppHandler {
             selection: None,
             mouse_pressed: false,
             last_mouse_pos: (0.0, 0.0),
+            ime_active: false,
             frame_count: 0,
             fps_timer: Instant::now(),
             debug_timing,
@@ -310,6 +313,12 @@ impl ApplicationHandler for AppHandler {
             // IME composition (Chinese, Japanese, Korean input, dead keys)
             WindowEvent::Ime(ime) => {
                 match ime {
+                    winit::event::Ime::Enabled => {
+                        state.ime_active = true;
+                    }
+                    winit::event::Ime::Disabled => {
+                        state.ime_active = false;
+                    }
                     winit::event::Ime::Commit(text) => {
                         let active = state.workspace_mgr.active_workspace().active_pane();
                         if let Some(ps) = state.pane_states.get(&active) {
@@ -317,7 +326,9 @@ impl ApplicationHandler for AppHandler {
                         }
                         state.window.request_redraw();
                     }
-                    _ => {} // Preedit / Enabled / Disabled — ignore for now
+                    winit::event::Ime::Preedit(..) => {
+                        // TODO: visual preedit feedback
+                    }
                 }
             }
 
@@ -572,13 +583,13 @@ impl ApplicationHandler for AppHandler {
                         if ch.len() == 1 && ch[0].is_ascii_alphabetic() {
                             Some(vec![ch[0].to_ascii_lowercase() - b'a' + 1])
                         } else {
-                            key_to_bytes(&event)
+                            key_to_bytes(&event, state.ime_active)
                         }
                     } else {
-                        key_to_bytes(&event)
+                        key_to_bytes(&event, state.ime_active)
                     }
                 } else {
-                    key_to_bytes(&event)
+                    key_to_bytes(&event, state.ime_active)
                 };
                 if let Some(bytes) = bytes {
                     let active = state.workspace_mgr.active_workspace().active_pane();
@@ -708,8 +719,8 @@ impl ApplicationHandler for AppHandler {
 }
 
 /// Convert winit key events to bytes for PTY input
-fn key_to_bytes(event: &winit::event::KeyEvent) -> Option<Vec<u8>> {
-    // Named keys (arrows, enter, etc.) first
+fn key_to_bytes(event: &winit::event::KeyEvent, ime_active: bool) -> Option<Vec<u8>> {
+    // Named keys (arrows, enter, etc.) — always handled here regardless of IME state
     if let Key::Named(named) = &event.logical_key {
         let bytes: &[u8] = match named {
             NamedKey::Enter => b"\r",
@@ -732,9 +743,13 @@ fn key_to_bytes(event: &winit::event::KeyEvent) -> Option<Vec<u8>> {
         return Some(bytes.to_vec());
     }
 
-    // For all other keys (Character, etc.), use event.text which
-    // accounts for keyboard layout, modifiers (Shift, Option/Alt),
-    // dead keys, and IME composition. This handles: . ~ ! @ # $ etc.
+    // When IME is active, character input comes via Ime::Commit,
+    // so we skip event.text here to avoid duplicate input.
+    if ime_active {
+        return None;
+    }
+
+    // Fallback: use event.text for keyboard layouts, Shift+key, etc.
     if let Some(text) = &event.text {
         let s = text.as_str();
         if !s.is_empty() {
