@@ -38,6 +38,8 @@ struct PaneBuffer {
     lines: Vec<LineBuffer>,
     /// Background rects in cell-relative coords (col, row, color)
     bg_cells: Vec<BgCell>,
+    /// Cursor position and color for vertical bar rendering
+    cursor: Option<(u16, u16, [f32; 4])>, // (col, row, color)
 }
 
 /// A cell that needs a non-default background
@@ -75,7 +77,7 @@ impl TextRenderer {
     ) -> Self {
         let scale = scale_factor as f32;
         let scaled_font_size = font_size * scale;
-        let scaled_line_height = (font_size * 1.4) * scale;
+        let scaled_line_height = (font_size * 1.22) * scale;
 
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
@@ -115,7 +117,7 @@ impl TextRenderer {
         let scale = scale_factor as f32;
         self.scale_factor = scale;
         self.font_size = font_size * scale;
-        self.line_height = (font_size * 1.4) * scale;
+        self.line_height = (font_size * 1.22) * scale;
         let metrics = Metrics::new(self.font_size, self.line_height);
         for pb in self.pane_buffers.values_mut() {
             for lb in &mut pb.lines {
@@ -138,6 +140,7 @@ impl TextRenderer {
         let pb = self.pane_buffers.entry(pane_id).or_insert_with(|| PaneBuffer {
             lines: Vec::new(),
             bg_cells: Vec::new(),
+            cursor: None,
         });
 
         // Ensure correct number of line buffers
@@ -168,23 +171,29 @@ impl TextRenderer {
             }
         }
 
-        let default_attrs = Attrs::new().family(Family::Monospace);
+        // Store cursor for vertical bar rendering in collect_bg_rects
         let (cursor_col, cursor_row) = cursor_pos;
+        if cursor_visible {
+            pb.cursor = Some((cursor_col, cursor_row, [
+                cursor_color.r as f32 / 255.0,
+                cursor_color.g as f32 / 255.0,
+                cursor_color.b as f32 / 255.0,
+                1.0,
+            ]));
+        } else {
+            pb.cursor = None;
+        }
+
+        let default_attrs = Attrs::new().family(Family::Monospace);
 
         for (row_idx, line) in grid.iter().enumerate() {
-            let line_cursor = if cursor_visible && row_idx == cursor_row as usize {
-                Some(cursor_col)
-            } else {
-                None
-            };
-
-            let hash = hash_line(line, line_cursor, cursor_color);
+            let hash = hash_line(line);
             if hash == pb.lines[row_idx].content_hash {
                 continue;
             }
             pb.lines[row_idx].content_hash = hash;
 
-            let (text, spans) = build_line_rich_text(line, line_cursor, cursor_color);
+            let (text, spans) = build_line_rich_text(line);
             let rich: Vec<(&str, Attrs)> = spans
                 .iter()
                 .map(|span| {
@@ -300,6 +309,7 @@ impl TextRenderer {
     pub fn collect_bg_rects(&self, panes: &[(PaneId, PixelRect)]) -> Vec<crate::bg::BgRect> {
         let cell_w = self.font_size * 0.6;
         let cell_h = self.line_height;
+        let cursor_bar_w = 2.0 * self.scale_factor; // 2px logical width vertical bar
         let mut rects = Vec::new();
         for (pane_id, rect) in panes {
             if let Some(pb) = self.pane_buffers.get(pane_id) {
@@ -310,6 +320,16 @@ impl TextRenderer {
                         w: cell_w,
                         h: cell_h,
                         color: bg.color,
+                    });
+                }
+                // Vertical bar cursor (iTerm2 style)
+                if let Some((col, row, color)) = pb.cursor {
+                    rects.push(crate::bg::BgRect {
+                        x: rect.x + col as f32 * cell_w,
+                        y: rect.y + row as f32 * cell_h,
+                        w: cursor_bar_w,
+                        h: cell_h,
+                        color,
                     });
                 }
             }
@@ -326,26 +346,18 @@ impl TextRenderer {
     }
 }
 
-/// Hash a single terminal line including cursor state
-fn hash_line(line: &GridLine, cursor_col: Option<u16>, cursor_color: RgbColor) -> u64 {
+/// Hash a single terminal line for change detection
+fn hash_line(line: &GridLine) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (col, cell) in line.cells.iter().enumerate() {
-        let is_cursor = cursor_col.map_or(false, |c| c as usize == col);
-        if is_cursor {
-            0xFFu8.hash(&mut hasher);
-            cursor_color.r.hash(&mut hasher);
-            cursor_color.g.hash(&mut hasher);
-            cursor_color.b.hash(&mut hasher);
-        } else {
-            cell.c.hash(&mut hasher);
-            cell.fg.r.hash(&mut hasher);
-            cell.fg.g.hash(&mut hasher);
-            cell.fg.b.hash(&mut hasher);
-            cell.bold.hash(&mut hasher);
-            cell.italic.hash(&mut hasher);
-            cell.wide_spacer.hash(&mut hasher);
-        }
+    for cell in line.cells.iter() {
+        cell.c.hash(&mut hasher);
+        cell.fg.r.hash(&mut hasher);
+        cell.fg.g.hash(&mut hasher);
+        cell.fg.b.hash(&mut hasher);
+        cell.bold.hash(&mut hasher);
+        cell.italic.hash(&mut hasher);
+        cell.wide_spacer.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -353,8 +365,6 @@ fn hash_line(line: &GridLine, cursor_col: Option<u16>, cursor_color: RgbColor) -
 /// Build rich text spans for a single terminal line
 fn build_line_rich_text(
     line: &GridLine,
-    cursor_col: Option<u16>,
-    cursor_color: RgbColor,
 ) -> (String, Vec<RichSpan>) {
     let mut text = String::with_capacity(line.cells.len());
     let mut spans: Vec<RichSpan> = Vec::with_capacity(8);
@@ -364,24 +374,16 @@ fn build_line_rich_text(
     let mut cur_italic = false;
     let mut span_start = 0;
 
-    for (col, cell) in line.cells.iter().enumerate() {
-        // Skip spacer cells for wide (CJK) characters — the preceding cell
-        // already contains the full character; the spacer is just a placeholder.
+    for (_col, cell) in line.cells.iter().enumerate() {
+        // Skip spacer cells for wide (CJK) characters
         if cell.wide_spacer {
             continue;
         }
 
-        let is_cursor = cursor_col.map_or(false, |c| c as usize == col);
-        let ch = if is_cursor {
-            '█'
-        } else if cell.c == '\0' {
-            ' '
-        } else {
-            cell.c
-        };
-        let fg = if is_cursor { cursor_color } else { cell.fg };
-        let bold = if is_cursor { false } else { cell.bold };
-        let italic = if is_cursor { false } else { cell.italic };
+        let ch = if cell.c == '\0' { ' ' } else { cell.c };
+        let fg = cell.fg;
+        let bold = cell.bold;
+        let italic = cell.italic;
 
         if fg != cur_fg || bold != cur_bold || italic != cur_italic {
             let cur_pos = text.len();

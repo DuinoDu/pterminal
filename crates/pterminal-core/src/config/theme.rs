@@ -54,7 +54,7 @@ impl RgbColor {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            name: "monokai".to_string(),
+            name: "iterm2-default".to_string(),
             colors: ThemeColors::default(),
         }
     }
@@ -62,32 +62,32 @@ impl Default for Theme {
 
 impl Default for ThemeColors {
     fn default() -> Self {
-        // Monokai theme — matches cmux
+        // iTerm2 default dark theme (Snazzy variant)
         Self {
-            background: RgbColor::new(0x27, 0x28, 0x22),  // #272822
-            foreground: RgbColor::new(0xfd, 0xff, 0xf1),  // #fdfff1
-            cursor: RgbColor::new(0xc0, 0xc1, 0xb5),      // #c0c1b5
-            selection_bg: RgbColor::new(0x57, 0x58, 0x4f),  // #57584f
-            selection_fg: RgbColor::new(0xfd, 0xff, 0xf1),  // #fdfff1
+            background: RgbColor::new(0x27, 0x29, 0x35),  // #272935
+            foreground: RgbColor::new(0xef, 0xf0, 0xea),  // #eff0ea
+            cursor: RgbColor::new(0xe9, 0xe9, 0xe9),      // #e9e9e9
+            selection_bg: RgbColor::new(0x92, 0xbb, 0xd0),  // #92bbd0
+            selection_fg: RgbColor::new(0x00, 0x00, 0x00),  // #000000
             ansi: [
                 // Normal colors (0-7)
-                RgbColor::new(0x27, 0x28, 0x22), // 0 black    #272822
-                RgbColor::new(0xf9, 0x26, 0x72), // 1 red      #f92672
-                RgbColor::new(0xa6, 0xe2, 0x2e), // 2 green    #a6e22e
-                RgbColor::new(0xe6, 0xdb, 0x74), // 3 yellow   #e6db74
-                RgbColor::new(0xfd, 0x97, 0x1f), // 4 blue/org #fd971f
-                RgbColor::new(0xae, 0x81, 0xff), // 5 magenta  #ae81ff
-                RgbColor::new(0x66, 0xd9, 0xef), // 6 cyan     #66d9ef
-                RgbColor::new(0xfd, 0xff, 0xf1), // 7 white    #fdfff1
+                RgbColor::new(0x00, 0x00, 0x00), // 0 black    #000000
+                RgbColor::new(0xff, 0x5b, 0x56), // 1 red      #ff5b56
+                RgbColor::new(0x5a, 0xf7, 0x8d), // 2 green    #5af78d
+                RgbColor::new(0xf3, 0xf9, 0x9c), // 3 yellow   #f3f99c
+                RgbColor::new(0x57, 0xc7, 0xfe), // 4 blue     #57c7fe
+                RgbColor::new(0xff, 0x69, 0xc0), // 5 magenta  #ff69c0
+                RgbColor::new(0x9a, 0xec, 0xfe), // 6 cyan     #9aecfe
+                RgbColor::new(0xf1, 0xf1, 0xf0), // 7 white    #f1f1f0
                 // Bright colors (8-15)
-                RgbColor::new(0x6e, 0x70, 0x66), // 8  bright black   #6e7066
-                RgbColor::new(0xf9, 0x26, 0x72), // 9  bright red     #f92672
-                RgbColor::new(0xa6, 0xe2, 0x2e), // 10 bright green   #a6e22e
-                RgbColor::new(0xe6, 0xdb, 0x74), // 11 bright yellow  #e6db74
-                RgbColor::new(0xfd, 0x97, 0x1f), // 12 bright blue    #fd971f
-                RgbColor::new(0xae, 0x81, 0xff), // 13 bright magenta #ae81ff
-                RgbColor::new(0x66, 0xd9, 0xef), // 14 bright cyan    #66d9ef
-                RgbColor::new(0xfd, 0xff, 0xf1), // 15 bright white   #fdfff1
+                RgbColor::new(0x68, 0x67, 0x67), // 8  bright black   #686767
+                RgbColor::new(0xff, 0x5b, 0x56), // 9  bright red     #ff5b56
+                RgbColor::new(0x5a, 0xf7, 0x8d), // 10 bright green   #5af78d
+                RgbColor::new(0xf3, 0xf9, 0x9c), // 11 bright yellow  #f3f99c
+                RgbColor::new(0x57, 0xc7, 0xfe), // 12 bright blue    #57c7fe
+                RgbColor::new(0xff, 0x69, 0xc0), // 13 bright magenta #ff69c0
+                RgbColor::new(0x9a, 0xec, 0xfe), // 14 bright cyan    #9aecfe
+                RgbColor::new(0xf1, 0xf1, 0xf0), // 15 bright white   #f1f1f0
             ],
         }
     }

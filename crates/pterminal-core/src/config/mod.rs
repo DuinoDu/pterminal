@@ -182,7 +182,7 @@ impl Default for GeneralConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: "JetBrains Mono".to_string(),
+            family: "Monaco".to_string(),
             size: 14.0,
             bold_is_bright: false,
         }
