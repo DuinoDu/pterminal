@@ -145,6 +145,7 @@ impl TerminalEmulator {
                     bold: flags.contains(Flags::BOLD),
                     italic: flags.contains(Flags::ITALIC),
                     underline: flags.contains(Flags::UNDERLINE),
+                    wide_spacer: flags.contains(Flags::WIDE_CHAR_SPACER),
                 });
             }
             lines.push(GridLine { cells });
@@ -180,6 +181,8 @@ pub struct GridCell {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    /// True if this cell is a spacer for a preceding wide (CJK) character
+    pub wide_spacer: bool,
 }
 
 /// Convert alacritty_terminal color to our RgbColor

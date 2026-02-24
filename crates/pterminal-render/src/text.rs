@@ -199,7 +199,7 @@ impl TextRenderer {
                 &mut self.font_system,
                 rich,
                 default_attrs,
-                Shaping::Basic,
+                Shaping::Advanced,
             );
             pb.lines[row_idx]
                 .buffer
@@ -338,6 +338,7 @@ fn hash_line(line: &GridLine, cursor_col: Option<u16>, cursor_color: RgbColor) -
             cell.fg.b.hash(&mut hasher);
             cell.bold.hash(&mut hasher);
             cell.italic.hash(&mut hasher);
+            cell.wide_spacer.hash(&mut hasher);
         }
     }
     hasher.finish()
@@ -358,6 +359,12 @@ fn build_line_rich_text(
     let mut span_start = 0;
 
     for (col, cell) in line.cells.iter().enumerate() {
+        // Skip spacer cells for wide (CJK) characters — the preceding cell
+        // already contains the full character; the spacer is just a placeholder.
+        if cell.wide_spacer {
+            continue;
+        }
+
         let is_cursor = cursor_col.map_or(false, |c| c as usize == col);
         let ch = if is_cursor {
             '█'
