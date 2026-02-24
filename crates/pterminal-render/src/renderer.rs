@@ -55,15 +55,21 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox // lowest latency, no vsync stall
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width,
             height,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
 

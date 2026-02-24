@@ -44,6 +44,8 @@ struct PaneState {
     emulator: TerminalEmulator,
     pty: PtyHandle,
     dirty: Arc<AtomicBool>,
+    /// Last cursor visible state used in rendering (for blink-only updates)
+    last_cursor_visible: bool,
 }
 
 /// Main application state
@@ -171,7 +173,7 @@ impl AppHandler {
 
         info!(pane_id, cols, rows, %shell, "Pane spawned");
 
-        PaneState { emulator, pty, dirty }
+        PaneState { emulator, pty, dirty, last_cursor_visible: true }
     }
 
     /// Calculate cols/rows from a physical-pixel pane rect
@@ -545,28 +547,35 @@ impl ApplicationHandler for AppHandler {
                 let h = state.renderer.height();
 
                 let layout = state.workspace_mgr.active_workspace().split_tree.layout();
+                let active_pane = state.workspace_mgr.active_workspace().active_pane();
 
-                // Build pixel rects and set content for each visible pane
                 let mut pane_rects: Vec<(PaneId, PixelRect)> = Vec::with_capacity(layout.len());
                 let cursor_color = theme.colors.cursor;
 
                 for (pane_id, pane_rect) in &layout {
                     let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale);
 
-                    if let Some(ps) = state.pane_states.get(pane_id) {
-                        let grid = ps.emulator.extract_grid(theme);
-                        let cursor_pos = ps.emulator.cursor_position();
-                        // Only show cursor in the active pane
-                        let active = state.workspace_mgr.active_workspace().active_pane();
-                        let show_cursor = *pane_id == active && state.cursor_visible;
+                    if let Some(ps) = state.pane_states.get_mut(pane_id) {
+                        let is_active = *pane_id == active_pane;
+                        let show_cursor = is_active && state.cursor_visible;
+                        let content_dirty = ps.dirty.load(Ordering::Acquire);
+                        let cursor_changed = is_active && ps.last_cursor_visible != show_cursor;
 
-                        state.renderer.text_renderer.set_pane_content(
-                            *pane_id,
-                            &grid,
-                            cursor_pos,
-                            show_cursor,
-                            cursor_color,
-                        );
+                        // Only extract grid + rebuild spans when content or cursor changed
+                        if content_dirty || cursor_changed {
+                            let grid = ps.emulator.extract_grid(theme);
+                            let cursor_pos = ps.emulator.cursor_position();
+
+                            state.renderer.text_renderer.set_pane_content(
+                                *pane_id,
+                                &grid,
+                                cursor_pos,
+                                show_cursor,
+                                cursor_color,
+                            );
+                            ps.last_cursor_visible = show_cursor;
+                            ps.dirty.store(false, Ordering::Relaxed);
+                        }
                     }
 
                     pane_rects.push((*pane_id, px_rect));
@@ -582,10 +591,6 @@ impl ApplicationHandler for AppHandler {
                 let _ = state
                     .renderer
                     .render_frame(theme.colors.background, |_| {});
-
-                for ps in state.pane_states.values() {
-                    ps.dirty.store(false, Ordering::Relaxed);
-                }
             }
 
             _ => {}
@@ -594,32 +599,33 @@ impl ApplicationHandler for AppHandler {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.app.state {
-            // Poll events for all panes
-            for ps in state.pane_states.values() {
-                let _ = ps.emulator.poll_events();
+            // Poll events for all visible panes only
+            let active_panes = state.workspace_mgr.active_workspace().pane_ids();
+            for pid in &active_panes {
+                if let Some(ps) = state.pane_states.get(pid) {
+                    let _ = ps.emulator.poll_events();
+                }
             }
 
-            // Cursor blink
+            // Cursor blink — don't set pane dirty, just request_redraw
             let now = Instant::now();
+            let mut need_redraw = false;
             if self.app.config.cursor.blink
                 && now.duration_since(state.last_blink) >= state.blink_interval
             {
                 state.cursor_visible = !state.cursor_visible;
                 state.last_blink = now;
-                // Only need to redraw if the active pane is visible
-                let active = state.workspace_mgr.active_workspace().active_pane();
-                if let Some(ps) = state.pane_states.get(&active) {
-                    ps.dirty.store(true, Ordering::Relaxed);
-                }
+                need_redraw = true; // cursor changed, need redraw but not content rebuild
             }
 
-            // Check if any visible pane is dirty
-            let active_panes = state.workspace_mgr.active_workspace().pane_ids();
-            let any_dirty = active_panes.iter().any(|pid| {
-                state.pane_states.get(pid).map_or(false, |ps| ps.dirty.load(Ordering::Acquire))
-            });
+            // Check if any visible pane has new content
+            if !need_redraw {
+                need_redraw = active_panes.iter().any(|pid| {
+                    state.pane_states.get(pid).map_or(false, |ps| ps.dirty.load(Ordering::Acquire))
+                });
+            }
 
-            if any_dirty {
+            if need_redraw {
                 state.window.request_redraw();
             }
 

@@ -10,12 +10,19 @@ use pterminal_core::config::theme::RgbColor;
 use pterminal_core::split::PaneId;
 use pterminal_core::terminal::GridLine;
 
-/// A colored span of text for rich-text rendering
+/// A colored span of text for rich-text rendering (using byte ranges into shared buffer)
 struct RichSpan {
-    text: String,
+    start: usize,
+    end: usize,
     fg: RgbColor,
     bold: bool,
     italic: bool,
+}
+
+/// Flat buffer + spans approach: one String allocation, spans reference ranges
+struct SpanBuffer {
+    text: String,
+    spans: Vec<RichSpan>,
 }
 
 /// Pixel rectangle for pane positioning (physical pixels)
@@ -109,8 +116,8 @@ impl TextRenderer {
         cursor_visible: bool,
         cursor_color: RgbColor,
     ) {
-        let spans = build_rich_spans(grid, cursor_pos, cursor_visible, cursor_color);
-        let hash = hash_spans(&spans);
+        let span_buf = build_span_buffer(grid, cursor_pos, cursor_visible, cursor_color);
+        let hash = hash_span_buffer(&span_buf);
 
         // Create buffer on first access
         let pb = self.pane_buffers.entry(pane_id).or_insert_with(|| {
@@ -130,9 +137,10 @@ impl TextRenderer {
         pb.content_hash = hash;
 
         let default_attrs = Attrs::new().family(Family::Monospace);
-        let rich: Vec<(&str, Attrs)> = spans
+        let rich: Vec<(&str, Attrs)> = span_buf.spans
             .iter()
             .map(|span| {
+                let text_slice = &span_buf.text[span.start..span.end];
                 let mut attrs = default_attrs
                     .color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
                 if span.bold {
@@ -141,7 +149,7 @@ impl TextRenderer {
                 if span.italic {
                     attrs = attrs.style(Style::Italic);
                 }
-                (span.text.as_str(), attrs)
+                (text_slice, attrs)
             })
             .collect();
 
@@ -149,7 +157,7 @@ impl TextRenderer {
             &mut self.font_system,
             rich,
             default_attrs,
-            Shaping::Advanced,
+            Shaping::Basic,
         );
         pb.buffer
             .shape_until_scroll(&mut self.font_system, false);
@@ -242,29 +250,27 @@ impl TextRenderer {
     }
 }
 
-/// Build rich text spans from grid, grouping consecutive cells with same attributes.
-fn build_rich_spans(
+/// Build rich text spans from grid using a flat text buffer (zero per-span allocation).
+fn build_span_buffer(
     grid: &[GridLine],
     cursor_pos: (u16, u16),
     cursor_visible: bool,
     cursor_color: RgbColor,
-) -> Vec<RichSpan> {
+) -> SpanBuffer {
     let (cursor_col, cursor_row) = cursor_pos;
+    let estimated_chars = grid.len() * (if grid.is_empty() { 80 } else { grid[0].cells.len() + 1 });
+    let mut text = String::with_capacity(estimated_chars);
     let mut spans: Vec<RichSpan> = Vec::with_capacity(grid.len() * 4);
+
+    // Current span tracking
+    let mut cur_fg = RgbColor::new(255, 255, 255);
+    let mut cur_bold = false;
+    let mut cur_italic = false;
+    let mut span_start = 0;
 
     for (row_idx, line) in grid.iter().enumerate() {
         if row_idx > 0 {
-            // Newline gets default color from previous span or new span
-            if let Some(last) = spans.last_mut() {
-                last.text.push('\n');
-            } else {
-                spans.push(RichSpan {
-                    text: "\n".to_string(),
-                    fg: RgbColor::new(255, 255, 255),
-                    bold: false,
-                    italic: false,
-                });
-            }
+            text.push('\n');
         }
 
         for (col_idx, cell) in line.cells.iter().enumerate() {
@@ -280,38 +286,54 @@ fn build_rich_spans(
             let bold = if is_cursor { false } else { cell.bold };
             let italic = if is_cursor { false } else { cell.italic };
 
-            // Try to extend the last span if attributes match
-            if let Some(last) = spans.last_mut() {
-                if last.fg == fg && last.bold == bold && last.italic == italic {
-                    last.text.push(ch);
-                    continue;
+            // Check if attributes changed
+            if fg != cur_fg || bold != cur_bold || italic != cur_italic {
+                // Close current span if it has content
+                let cur_pos = text.len();
+                if cur_pos > span_start {
+                    spans.push(RichSpan {
+                        start: span_start,
+                        end: cur_pos,
+                        fg: cur_fg,
+                        bold: cur_bold,
+                        italic: cur_italic,
+                    });
                 }
+                span_start = cur_pos;
+                cur_fg = fg;
+                cur_bold = bold;
+                cur_italic = italic;
             }
 
-            // New span
-            spans.push(RichSpan {
-                text: String::from(ch),
-                fg,
-                bold,
-                italic,
-            });
+            text.push(ch);
         }
     }
 
-    spans
+    // Close final span
+    if text.len() > span_start {
+        spans.push(RichSpan {
+            start: span_start,
+            end: text.len(),
+            fg: cur_fg,
+            bold: cur_bold,
+            italic: cur_italic,
+        });
+    }
+
+    SpanBuffer { text, spans }
 }
 
-/// Simple hash of spans for change detection (avoids full string comparison)
-fn hash_spans(spans: &[RichSpan]) -> u64 {
+/// Fast hash of the flat span buffer
+fn hash_span_buffer(buf: &SpanBuffer) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for span in spans {
-        span.text.hash(&mut hasher);
+    buf.text.hash(&mut hasher);
+    for span in &buf.spans {
+        span.start.hash(&mut hasher);
         span.fg.r.hash(&mut hasher);
         span.fg.g.hash(&mut hasher);
         span.fg.b.hash(&mut hasher);
         span.bold.hash(&mut hasher);
-        span.italic.hash(&mut hasher);
     }
     hasher.finish()
 }
