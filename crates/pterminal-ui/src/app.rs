@@ -119,9 +119,9 @@ struct AppHandler {
 
 impl AppHandler {
     /// Get mouse position in physical pixels (renderer coordinate space)
+    /// CursorMoved on macOS gives PhysicalPosition — no scaling needed
     fn mouse_physical(state: &RunningState) -> (f32, f32) {
-        let scale = state.scale_factor as f32;
-        (state.last_mouse_pos.0 as f32 * scale, state.last_mouse_pos.1 as f32 * scale)
+        (state.last_mouse_pos.0 as f32, state.last_mouse_pos.1 as f32)
     }
 
     /// Convert mouse position to grid cell (col, row) for the active pane
