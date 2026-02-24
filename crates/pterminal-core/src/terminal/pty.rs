@@ -109,8 +109,8 @@ impl PtyHandle {
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
-        if let Some(handle) = self.reader_thread.take() {
-            let _ = handle.join();
-        }
+        // Don't join the reader thread — it may be blocked on read().
+        // Just detach it; it will exit when the PTY master fd is closed.
+        let _ = self.reader_thread.take();
     }
 }
