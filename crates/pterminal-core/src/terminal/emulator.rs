@@ -186,11 +186,27 @@ pub struct GridCell {
 pub fn alacritty_color_to_rgb(color: &ansi::Color, theme: &Theme) -> RgbColor {
     match color {
         ansi::Color::Named(named) => {
-            let idx = *named as usize;
-            if idx < 16 {
-                theme.colors.ansi[idx]
-            } else {
-                theme.colors.foreground
+            use ansi::NamedColor;
+            match named {
+                NamedColor::Foreground | NamedColor::BrightForeground => theme.colors.foreground,
+                NamedColor::Background => theme.colors.background,
+                NamedColor::Cursor => theme.colors.cursor,
+                NamedColor::DimBlack => dim_color(theme.colors.ansi[0]),
+                NamedColor::DimRed => dim_color(theme.colors.ansi[1]),
+                NamedColor::DimGreen => dim_color(theme.colors.ansi[2]),
+                NamedColor::DimYellow => dim_color(theme.colors.ansi[3]),
+                NamedColor::DimBlue => dim_color(theme.colors.ansi[4]),
+                NamedColor::DimMagenta => dim_color(theme.colors.ansi[5]),
+                NamedColor::DimCyan => dim_color(theme.colors.ansi[6]),
+                NamedColor::DimWhite => dim_color(theme.colors.ansi[7]),
+                _ => {
+                    let idx = *named as usize;
+                    if idx < 16 {
+                        theme.colors.ansi[idx]
+                    } else {
+                        theme.colors.foreground
+                    }
+                }
             }
         }
         ansi::Color::Spec(rgb) => RgbColor::new(rgb.r, rgb.g, rgb.b),
@@ -203,6 +219,15 @@ pub fn alacritty_color_to_rgb(color: &ansi::Color, theme: &Theme) -> RgbColor {
             }
         }
     }
+}
+
+/// Dim a color by reducing brightness ~33%
+fn dim_color(c: RgbColor) -> RgbColor {
+    RgbColor::new(
+        (c.r as u16 * 2 / 3) as u8,
+        (c.g as u16 * 2 / 3) as u8,
+        (c.b as u16 * 2 / 3) as u8,
+    )
 }
 
 fn index_256_to_rgb(idx: u8) -> RgbColor {
