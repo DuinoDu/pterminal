@@ -244,6 +244,11 @@ impl AppHandler {
             emulator_handle.process(data);
             dirty_for_pty.store(true, Ordering::Release);
             window_for_redraw.request_redraw();
+        }, {
+            let window_exit = window.clone();
+            move || {
+                window_exit.request_redraw();
+            }
         })
         .expect("spawn PTY");
 

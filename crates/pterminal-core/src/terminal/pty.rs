@@ -23,6 +23,7 @@ impl PtyHandle {
         cols: u16,
         rows: u16,
         on_output: impl Fn(&[u8]) + Send + 'static,
+        on_exit: impl Fn() + Send + 'static,
     ) -> Result<Self> {
         let pty_system = NativePtySystem::default();
 
@@ -69,6 +70,7 @@ impl PtyHandle {
                     }
                 }
                 exited_clone.store(true, Ordering::Release);
+                on_exit();
             })?;
 
         Ok(Self {
