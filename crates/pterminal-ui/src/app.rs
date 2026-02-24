@@ -531,7 +531,23 @@ impl ApplicationHandler for AppHandler {
                 }
 
                 // Send keystrokes to the active pane's PTY
-                if let Some(bytes) = key_to_bytes(&event) {
+                // Handle Ctrl+letter → control character (0x01..0x1A)
+                let ctrl = state.modifiers.control_key();
+                let bytes = if ctrl {
+                    if let Key::Character(ref c) = event.logical_key {
+                        let ch = c.as_str().as_bytes();
+                        if ch.len() == 1 && ch[0].is_ascii_alphabetic() {
+                            Some(vec![ch[0].to_ascii_lowercase() - b'a' + 1])
+                        } else {
+                            key_to_bytes(&event)
+                        }
+                    } else {
+                        key_to_bytes(&event)
+                    }
+                } else {
+                    key_to_bytes(&event)
+                };
+                if let Some(bytes) = bytes {
                     let active = state.workspace_mgr.active_workspace().active_pane();
                     if let Some(ps) = state.pane_states.get(&active) {
                         let _ = ps.pty.write(&bytes);
