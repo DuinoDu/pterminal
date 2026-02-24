@@ -1,0 +1,12 @@
+[package]
+name = "pterminal-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pterminal-core.workspace = true
+wgpu.workspace = true
+glyphon.workspace = true
+cosmic-text.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

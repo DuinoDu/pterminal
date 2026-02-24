@@ -1,0 +1,194 @@
+use std::sync::{Arc, Mutex};
+
+use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::{self, Term};
+use alacritty_terminal::vte::ansi::{self, StdSyncHandler};
+
+use crate::config::theme::{RgbColor, Theme};
+use crate::event::TermEvent;
+
+/// Event listener that collects events
+#[derive(Clone)]
+struct Listener {
+    sender: std::sync::mpsc::Sender<TermEvent>,
+}
+
+impl EventListener for Listener {
+    fn send_event(&self, event: AlacrittyEvent) {
+        match event {
+            AlacrittyEvent::Title(title) => {
+                let _ = self.sender.send(TermEvent::TitleChanged(title));
+            }
+            AlacrittyEvent::Bell => {
+                let _ = self.sender.send(TermEvent::Bell);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Terminal emulator wrapping alacritty_terminal
+pub struct TerminalEmulator {
+    term: Arc<Mutex<Term<Listener>>>,
+    event_rx: std::sync::mpsc::Receiver<TermEvent>,
+}
+
+impl TerminalEmulator {
+    pub fn new(cols: u16, rows: u16) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listener = Listener { sender: tx };
+        let size = TermSize::new(cols as usize, rows as usize);
+        let term = Term::new(term::Config::default(), &size, listener);
+
+        Self {
+            term: Arc::new(Mutex::new(term)),
+            event_rx: rx,
+        }
+    }
+
+    /// Process raw bytes from PTY output
+    pub fn process(&self, data: &[u8]) {
+        let mut term = self.term.lock().unwrap();
+        let mut processor: ansi::Processor<StdSyncHandler> = ansi::Processor::new();
+        processor.advance(&mut *term, data);
+    }
+
+    /// Drain pending events
+    pub fn poll_events(&self) -> Vec<TermEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.event_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// Get current dimensions
+    pub fn size(&self) -> (u16, u16) {
+        let term = self.term.lock().unwrap();
+        (term.columns() as u16, term.screen_lines() as u16)
+    }
+
+    /// Resize the terminal
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let mut term = self.term.lock().unwrap();
+        let size = TermSize::new(cols as usize, rows as usize);
+        term.resize(size);
+    }
+
+    /// Clone the inner Arc for sharing with PTY reader thread
+    pub fn clone_inner(&self) -> TerminalEmulatorHandle {
+        TerminalEmulatorHandle {
+            term: Arc::clone(&self.term),
+        }
+    }
+
+    /// Extract terminal grid content for rendering
+    pub fn extract_grid(&self, theme: &Theme) -> Vec<GridLine> {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock().unwrap();
+        let grid = term.grid();
+        let num_lines = grid.screen_lines();
+        let num_cols = grid.columns();
+        let mut lines = Vec::with_capacity(num_lines);
+
+        for line_idx in 0..num_lines {
+            let mut cells = Vec::with_capacity(num_cols);
+            for col_idx in 0..num_cols {
+                let point = alacritty_terminal::index::Point::new(
+                    Line(line_idx as i32),
+                    Column(col_idx),
+                );
+                let cell = &grid[point];
+                let fg = alacritty_color_to_rgb(&cell.fg, theme);
+                let bg = alacritty_color_to_rgb(&cell.bg, theme);
+                let flags = cell.flags;
+
+                cells.push(GridCell {
+                    c: cell.c,
+                    fg,
+                    bg,
+                    bold: flags.contains(Flags::BOLD),
+                    italic: flags.contains(Flags::ITALIC),
+                    underline: flags.contains(Flags::UNDERLINE),
+                });
+            }
+            lines.push(GridLine { cells });
+        }
+
+        lines
+    }
+}
+
+/// Handle for sharing emulator with PTY reader thread
+pub struct TerminalEmulatorHandle {
+    term: Arc<Mutex<Term<Listener>>>,
+}
+
+impl TerminalEmulatorHandle {
+    pub fn process(&self, data: &[u8]) {
+        let mut term = self.term.lock().unwrap();
+        let mut processor: ansi::Processor<StdSyncHandler> = ansi::Processor::new();
+        processor.advance(&mut *term, data);
+    }
+}
+
+/// A line of terminal cells
+pub struct GridLine {
+    pub cells: Vec<GridCell>,
+}
+
+/// A single terminal cell extracted for rendering
+pub struct GridCell {
+    pub c: char,
+    pub fg: RgbColor,
+    pub bg: RgbColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+/// Convert alacritty_terminal color to our RgbColor
+pub fn alacritty_color_to_rgb(color: &ansi::Color, theme: &Theme) -> RgbColor {
+    match color {
+        ansi::Color::Named(named) => {
+            let idx = *named as usize;
+            if idx < 16 {
+                theme.colors.ansi[idx]
+            } else {
+                theme.colors.foreground
+            }
+        }
+        ansi::Color::Spec(rgb) => RgbColor::new(rgb.r, rgb.g, rgb.b),
+        ansi::Color::Indexed(idx) => {
+            if (*idx as usize) < 16 {
+                theme.colors.ansi[*idx as usize]
+            } else {
+                // 256-color palette: compute from index
+                index_256_to_rgb(*idx)
+            }
+        }
+    }
+}
+
+fn index_256_to_rgb(idx: u8) -> RgbColor {
+    if idx < 16 {
+        // Should be handled by caller
+        RgbColor::new(0, 0, 0)
+    } else if idx < 232 {
+        // 216 color cube: 6x6x6
+        let idx = idx - 16;
+        let r = (idx / 36) % 6;
+        let g = (idx / 6) % 6;
+        let b = idx % 6;
+        let to_val = |v: u8| if v == 0 { 0 } else { 55 + 40 * v };
+        RgbColor::new(to_val(r), to_val(g), to_val(b))
+    } else {
+        // Grayscale ramp
+        let v = 8 + 10 * (idx - 232);
+        RgbColor::new(v, v, v)
+    }
+}

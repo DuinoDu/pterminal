@@ -1,0 +1,86 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pterminal-core",
+    "crates/pterminal-render",
+    "crates/pterminal-ui",
+    "crates/pterminal-ipc",
+    "cli",
+    ".",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+# Terminal
+alacritty_terminal = "0.25"
+portable-pty = "0.8"
+
+# GPU rendering
+wgpu = "23"
+winit = "0.30"
+glyphon = "0.7"
+cosmic-text = "0.12"
+pollster = "0.4"
+
+# Async / IPC
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros"] }
+
+# Serialization / Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Notifications
+notify-rust = "4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+directories = "6"
+anyhow = "1"
+
+# Internal crates
+pterminal-core = { path = "crates/pterminal-core" }
+pterminal-render = { path = "crates/pterminal-render" }
+pterminal-ui = { path = "crates/pterminal-ui" }
+pterminal-ipc = { path = "crates/pterminal-ipc" }
+
+[package]
+name = "pterminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pterminal"
+path = "src/main.rs"
+
+[dependencies]
+pterminal-core.workspace = true
+pterminal-render.workspace = true
+pterminal-ui.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

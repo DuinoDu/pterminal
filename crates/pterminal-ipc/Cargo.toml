@@ -1,0 +1,12 @@
+[package]
+name = "pterminal-ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pterminal-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

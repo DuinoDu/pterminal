@@ -1,0 +1,13 @@
+[package]
+name = "pterminal-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pterminal-core.workspace = true
+pterminal-render.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

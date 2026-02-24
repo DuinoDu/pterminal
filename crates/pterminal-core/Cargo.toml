@@ -1,0 +1,14 @@
+[package]
+name = "pterminal-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+directories.workspace = true
+uuid.workspace = true
