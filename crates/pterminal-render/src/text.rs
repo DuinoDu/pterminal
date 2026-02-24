@@ -63,6 +63,16 @@ pub struct TextRenderer {
     scale_factor: f32,
     font_size: f32,
     line_height: f32,
+    /// Tab bar label buffer (None = no tab bar)
+    tab_bar: Option<TabBar>,
+}
+
+/// Tab bar state
+struct TabBar {
+    buffer: Buffer,
+    height: f32, // physical pixels
+    bg_rects: Vec<crate::bg::BgRect>,
+    content_hash: u64,
 }
 
 impl TextRenderer {
@@ -105,6 +115,7 @@ impl TextRenderer {
             scale_factor: scale,
             font_size: scaled_font_size,
             line_height: scaled_line_height,
+            tab_bar: None,
         }
     }
 
@@ -257,32 +268,47 @@ impl TextRenderer {
         let default_glyphon_color = Color::rgb(default_color.r, default_color.g, default_color.b);
         let line_h = self.line_height;
 
-        let text_areas: Vec<TextArea<'_>> = panes
-            .iter()
-            .filter_map(|(pane_id, rect)| {
-                let pb = self.pane_buffers.get(pane_id)?;
-                Some(
-                    pb.lines
-                        .iter()
-                        .enumerate()
-                        .map(move |(idx, lb)| TextArea {
-                            buffer: &lb.buffer,
-                            left: rect.x,
-                            top: rect.y + idx as f32 * line_h,
-                            scale: 1.0,
-                            bounds: TextBounds {
-                                left: rect.x as i32,
-                                top: rect.y as i32,
-                                right: (rect.x + rect.w) as i32,
-                                bottom: (rect.y + rect.h) as i32,
-                            },
-                            default_color: default_glyphon_color,
-                            custom_glyphs: &[],
-                        }),
-                )
-            })
-            .flatten()
-            .collect();
+        let mut text_areas: Vec<TextArea<'_>> = Vec::new();
+
+        // Tab bar text
+        if let Some(ref tb) = self.tab_bar {
+            text_areas.push(TextArea {
+                buffer: &tb.buffer,
+                left: 0.0,
+                top: 0.0,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: self.width as i32,
+                    bottom: tb.height as i32,
+                },
+                default_color: default_glyphon_color,
+                custom_glyphs: &[],
+            });
+        }
+
+        // Pane text
+        for (pane_id, rect) in panes {
+            if let Some(pb) = self.pane_buffers.get(pane_id) {
+                for (idx, lb) in pb.lines.iter().enumerate() {
+                    text_areas.push(TextArea {
+                        buffer: &lb.buffer,
+                        left: rect.x,
+                        top: rect.y + idx as f32 * line_h,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: rect.x as i32,
+                            top: rect.y as i32,
+                            right: (rect.x + rect.w) as i32,
+                            bottom: (rect.y + rect.h) as i32,
+                        },
+                        default_color: default_glyphon_color,
+                        custom_glyphs: &[],
+                    });
+                }
+            }
+        }
 
         let _ = self.glyphon_renderer.prepare(
             device,
@@ -309,8 +335,14 @@ impl TextRenderer {
     pub fn collect_bg_rects(&self, panes: &[(PaneId, PixelRect)]) -> Vec<crate::bg::BgRect> {
         let cell_w = self.font_size * 0.6;
         let cell_h = self.line_height;
-        let cursor_bar_w = 2.0 * self.scale_factor; // 2px logical width vertical bar
+        let cursor_bar_w = 2.0 * self.scale_factor;
         let mut rects = Vec::new();
+
+        // Tab bar bg rects
+        if let Some(ref tb) = self.tab_bar {
+            rects.extend_from_slice(&tb.bg_rects);
+        }
+
         for (pane_id, rect) in panes {
             if let Some(pb) = self.pane_buffers.get(pane_id) {
                 for bg in &pb.bg_cells {
@@ -343,6 +375,113 @@ impl TextRenderer {
 
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
+    }
+
+    /// Returns tab bar height in physical pixels (0 if no tab bar)
+    pub fn tab_bar_height(&self) -> f32 {
+        self.tab_bar.as_ref().map_or(0.0, |tb| tb.height)
+    }
+
+    /// Update tab bar content. Pass empty slice to hide.
+    pub fn set_tab_bar(
+        &mut self,
+        tabs: &[(String, bool)], // (label, is_active)
+        bar_bg: RgbColor,
+        active_bg: RgbColor,
+        fg: RgbColor,
+        active_fg: RgbColor,
+    ) {
+        if tabs.len() <= 1 {
+            self.tab_bar = None;
+            return;
+        }
+
+        // Hash to skip if unchanged
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (label, active) in tabs {
+            label.hash(&mut hasher);
+            active.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+
+        let tab_font_size = self.font_size * 0.8; // slightly smaller than terminal
+        let tab_height = tab_font_size * 1.6;
+        let tab_width = self.width as f32 / tabs.len() as f32;
+
+        if let Some(ref tb) = self.tab_bar {
+            if tb.content_hash == hash {
+                return;
+            }
+        }
+
+        // Build bg rects for each tab
+        let mut bg_rects = Vec::with_capacity(tabs.len() + 1);
+        // Full bar background
+        bg_rects.push(crate::bg::BgRect {
+            x: 0.0,
+            y: 0.0,
+            w: self.width as f32,
+            h: tab_height,
+            color: [
+                bar_bg.r as f32 / 255.0,
+                bar_bg.g as f32 / 255.0,
+                bar_bg.b as f32 / 255.0,
+                1.0,
+            ],
+        });
+        // Active tab highlight
+        for (i, (_label, active)) in tabs.iter().enumerate() {
+            if *active {
+                bg_rects.push(crate::bg::BgRect {
+                    x: i as f32 * tab_width,
+                    y: 0.0,
+                    w: tab_width,
+                    h: tab_height,
+                    color: [
+                        active_bg.r as f32 / 255.0,
+                        active_bg.g as f32 / 255.0,
+                        active_bg.b as f32 / 255.0,
+                        1.0,
+                    ],
+                });
+            }
+        }
+
+        // Build rich text: "  Tab 1  |  Tab 2  |  Tab 3  "
+        let metrics = Metrics::new(tab_font_size, tab_height);
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        buffer.set_size(&mut self.font_system, Some(self.width as f32), Some(tab_height));
+
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        for (i, (label, active)) in tabs.iter().enumerate() {
+            if i > 0 {
+                let sep_start = text.len();
+                text.push_str(" │ ");
+                spans.push((sep_start, text.len(), bar_bg)); // dim separator
+            }
+            let start = text.len();
+            text.push_str(&format!(" {} ", label));
+            spans.push((start, text.len(), if *active { active_fg } else { fg }));
+        }
+
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        let rich: Vec<(&str, Attrs)> = spans
+            .iter()
+            .map(|(s, e, color)| {
+                (&text[*s..*e], default_attrs.color(Color::rgb(color.r, color.g, color.b)))
+            })
+            .collect();
+        buffer.set_rich_text(&mut self.font_system, rich, default_attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+
+        self.tab_bar = Some(TabBar {
+            buffer,
+            height: tab_height,
+            bg_rects,
+            content_hash: hash,
+        });
     }
 }
 

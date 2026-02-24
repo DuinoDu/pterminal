@@ -11,7 +11,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use pterminal_core::config::theme::Theme;
+use pterminal_core::config::theme::{RgbColor, Theme};
 use pterminal_core::split::{PaneId, SplitDirection};
 use pterminal_core::terminal::{PtyHandle, TerminalEmulator};
 use pterminal_core::workspace::WorkspaceManager;
@@ -206,13 +206,14 @@ impl AppHandler {
         window_w: u32,
         window_h: u32,
         scale: f32,
+        tab_bar_h: f32,
     ) -> PixelRect {
         let content_w = window_w as f32;
-        let content_h = window_h as f32;
+        let content_h = window_h as f32 - tab_bar_h;
         let padding = 6.0 * scale;
         PixelRect {
             x: pane_rect.x * content_w + padding,
-            y: pane_rect.y * content_h + padding,
+            y: pane_rect.y * content_h + padding + tab_bar_h,
             w: pane_rect.width * content_w - padding * 2.0,
             h: pane_rect.height * content_h - padding * 2.0,
         }
@@ -243,7 +244,7 @@ impl AppHandler {
             if let Some((_, rect)) = pane_rect {
                 let w = state.renderer.width();
                 let h = state.renderer.height();
-                let pr = Self::pane_to_pixel_rect(rect, w, h, scale);
+                let pr = Self::pane_to_pixel_rect(rect, w, h, scale, state.renderer.text_renderer.tab_bar_height());
 
                 // Cursor top-left position in physical pixels;
                 // macOS places the candidate window just below this area
@@ -386,7 +387,7 @@ impl ApplicationHandler for AppHandler {
                 // Resize all panes in the active workspace based on their layout rects
                 let layout = state.workspace_mgr.active_workspace().split_tree.layout();
                 for (pane_id, pane_rect) in &layout {
-                    let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale);
+                    let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale, state.renderer.text_renderer.tab_bar_height());
                     let (cols, rows) = Self::pixel_rect_to_cols_rows(&px_rect, &state.renderer);
                     if let Some(ps) = state.pane_states.get(pane_id) {
                         ps.emulator.resize(cols, rows);
@@ -540,7 +541,7 @@ impl ApplicationHandler for AppHandler {
                                 let h = state.renderer.height();
                                 let layout = state.workspace_mgr.active_workspace().split_tree.layout();
                                 let (cols, rows) = if let Some((_, pr)) = layout.iter().find(|(id, _)| *id == new_pane_id) {
-                                    let px = Self::pane_to_pixel_rect(pr, w, h, scale);
+                                    let px = Self::pane_to_pixel_rect(pr, w, h, scale, state.renderer.text_renderer.tab_bar_height());
                                     Self::pixel_rect_to_cols_rows(&px, &state.renderer)
                                 } else {
                                     Self::rect_to_cols_rows(&state.renderer, state.scale_factor)
@@ -551,7 +552,7 @@ impl ApplicationHandler for AppHandler {
 
                                 // Also resize the original pane since it shrunk
                                 if let Some((_, pr)) = layout.iter().find(|(id, _)| *id == active_pane) {
-                                    let px = Self::pane_to_pixel_rect(pr, w, h, scale);
+                                    let px = Self::pane_to_pixel_rect(pr, w, h, scale, state.renderer.text_renderer.tab_bar_height());
                                     let (c, r) = Self::pixel_rect_to_cols_rows(&px, &state.renderer);
                                     if let Some(ops) = state.pane_states.get(&active_pane) {
                                         ops.emulator.resize(c, r);
@@ -639,6 +640,21 @@ impl ApplicationHandler for AppHandler {
                 let w = state.renderer.width();
                 let h = state.renderer.height();
 
+                // Update tab bar
+                let tab_count = state.workspace_mgr.workspace_count();
+                let active_idx = state.workspace_mgr.active_index();
+                let tabs: Vec<(String, bool)> = (0..tab_count)
+                    .map(|i| (format!("Tab {}", i + 1), i == active_idx))
+                    .collect();
+                let tab_bar_bg = RgbColor::new(0x1e, 0x1f, 0x29); // darker than terminal bg
+                let tab_active_bg = theme.colors.background;
+                let tab_fg = RgbColor::new(0x88, 0x88, 0x88);
+                let tab_active_fg = theme.colors.foreground;
+                state.renderer.text_renderer.set_tab_bar(
+                    &tabs, tab_bar_bg, tab_active_bg, tab_fg, tab_active_fg,
+                );
+                let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
+
                 let layout = state.workspace_mgr.active_workspace().split_tree.layout();
                 let active_pane = state.workspace_mgr.active_workspace().active_pane();
 
@@ -648,7 +664,7 @@ impl ApplicationHandler for AppHandler {
 
                 let t_grid = Instant::now();
                 for (pane_id, pane_rect) in &layout {
-                    let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale);
+                    let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale, tab_bar_h);
 
                     if let Some(ps) = state.pane_states.get_mut(pane_id) {
                         let show_cursor = *pane_id == active_pane;
