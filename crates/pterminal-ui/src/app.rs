@@ -82,7 +82,6 @@ struct ContextMenu {
     x: f32,         // physical pixels
     y: f32,
     items: Vec<ContextMenuItem>,
-    has_selection: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -544,7 +543,6 @@ impl ApplicationHandler for AppHandler {
             // Right-click context menu
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Right, .. } => {
                 if btn_state == ElementState::Pressed {
-                    let scale = state.scale_factor as f32;
                     let phys_x = state.last_mouse_pos.0 as f32;
                     let phys_y = state.last_mouse_pos.1 as f32;
                     let has_selection = state.selection.is_some();
@@ -557,7 +555,6 @@ impl ApplicationHandler for AppHandler {
                         x: phys_x,
                         y: phys_y,
                         items,
-                        has_selection,
                     });
                     state.window.request_redraw();
                 }
