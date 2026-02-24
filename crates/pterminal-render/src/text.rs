@@ -1,10 +1,19 @@
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonTextRenderer,
-    Viewport,
+    Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonTextRenderer,
+    Viewport, Weight,
 };
 
 use pterminal_core::config::theme::RgbColor;
+use pterminal_core::terminal::GridLine;
+
+/// A colored span of text for rich-text rendering
+struct RichSpan {
+    text: String,
+    fg: RgbColor,
+    bold: bool,
+    italic: bool,
+}
 
 /// Text rendering using glyphon (cosmic-text + wgpu)
 pub struct TextRenderer {
@@ -20,6 +29,8 @@ pub struct TextRenderer {
     font_size: f32,
     line_height: f32,
     content_dirty: bool,
+    /// Cached content hash for change detection
+    content_hash: u64,
 }
 
 impl TextRenderer {
@@ -63,6 +74,7 @@ impl TextRenderer {
             font_size: scaled_font_size,
             line_height: scaled_line_height,
             content_dirty: true,
+            content_hash: 0,
         }
     }
 
@@ -89,21 +101,58 @@ impl TextRenderer {
         self.content_dirty = true;
     }
 
-    /// Set the text content — only reshapes if content actually changed
-    pub fn set_terminal_content(&mut self, text: &str) {
-        self.buffer.set_text(
+    /// Set terminal content with per-cell ANSI colors.
+    /// Builds rich text spans grouping consecutive cells with same attributes.
+    pub fn set_terminal_content(
+        &mut self,
+        grid: &[GridLine],
+        cursor_pos: (u16, u16),
+        cursor_visible: bool,
+        cursor_color: RgbColor,
+    ) {
+        // Build spans: group consecutive cells with same (fg, bold, italic)
+        let spans = build_rich_spans(grid, cursor_pos, cursor_visible, cursor_color);
+
+        // Compute a simple hash for change detection
+        let hash = hash_spans(&spans);
+        if hash == self.content_hash && !self.content_dirty {
+            return;
+        }
+        self.content_hash = hash;
+
+        // Build (text_slice, Attrs) pairs for set_rich_text
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        let rich: Vec<(&str, Attrs)> = spans
+            .iter()
+            .map(|span| {
+                let mut attrs = default_attrs
+                    .color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
+                if span.bold {
+                    attrs = attrs.weight(Weight::BOLD);
+                }
+                if span.italic {
+                    attrs = attrs.style(Style::Italic);
+                }
+                (span.text.as_str(), attrs)
+            })
+            .collect();
+
+        self.buffer.set_rich_text(
             &mut self.font_system,
-            text,
-            Attrs::new().family(Family::Monospace),
+            rich,
+            default_attrs,
             Shaping::Advanced,
         );
-        self.buffer.shape_until_scroll(&mut self.font_system, false);
+        self.buffer
+            .shape_until_scroll(&mut self.font_system, false);
         self.content_dirty = true;
     }
 
     /// Prepare and render text
     pub fn render<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        let _ = self.glyphon_renderer.render(&self.atlas, &self.viewport, pass);
+        let _ = self
+            .glyphon_renderer
+            .render(&self.atlas, &self.viewport, pass);
     }
 
     /// Post-render cleanup: trim atlas
@@ -167,17 +216,76 @@ impl TextRenderer {
     }
 }
 
-/// A line of terminal cells for rendering
-pub struct TerminalLine {
-    pub cells: Vec<TerminalCell>,
+/// Build rich text spans from grid, grouping consecutive cells with same attributes.
+fn build_rich_spans(
+    grid: &[GridLine],
+    cursor_pos: (u16, u16),
+    cursor_visible: bool,
+    cursor_color: RgbColor,
+) -> Vec<RichSpan> {
+    let (cursor_col, cursor_row) = cursor_pos;
+    let mut spans: Vec<RichSpan> = Vec::with_capacity(grid.len() * 4);
+
+    for (row_idx, line) in grid.iter().enumerate() {
+        if row_idx > 0 {
+            // Newline gets default color from previous span or new span
+            if let Some(last) = spans.last_mut() {
+                last.text.push('\n');
+            } else {
+                spans.push(RichSpan {
+                    text: "\n".to_string(),
+                    fg: RgbColor::new(255, 255, 255),
+                    bold: false,
+                    italic: false,
+                });
+            }
+        }
+
+        for (col_idx, cell) in line.cells.iter().enumerate() {
+            let is_cursor =
+                cursor_visible && row_idx == cursor_row as usize && col_idx == cursor_col as usize;
+            let ch = if is_cursor {
+                '█'
+            } else {
+                let c = cell.c;
+                if c == '\0' { ' ' } else { c }
+            };
+            let fg = if is_cursor { cursor_color } else { cell.fg };
+            let bold = if is_cursor { false } else { cell.bold };
+            let italic = if is_cursor { false } else { cell.italic };
+
+            // Try to extend the last span if attributes match
+            if let Some(last) = spans.last_mut() {
+                if last.fg == fg && last.bold == bold && last.italic == italic {
+                    last.text.push(ch);
+                    continue;
+                }
+            }
+
+            // New span
+            spans.push(RichSpan {
+                text: String::from(ch),
+                fg,
+                bold,
+                italic,
+            });
+        }
+    }
+
+    spans
 }
 
-/// A single terminal cell
-pub struct TerminalCell {
-    pub c: char,
-    pub fg: RgbColor,
-    pub bg: RgbColor,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
+/// Simple hash of spans for change detection (avoids full string comparison)
+fn hash_spans(spans: &[RichSpan]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for span in spans {
+        span.text.hash(&mut hasher);
+        span.fg.r.hash(&mut hasher);
+        span.fg.g.hash(&mut hasher);
+        span.fg.b.hash(&mut hasher);
+        span.bold.hash(&mut hasher);
+        span.italic.hash(&mut hasher);
+    }
+    hasher.finish()
 }

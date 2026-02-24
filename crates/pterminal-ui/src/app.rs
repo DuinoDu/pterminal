@@ -2,17 +2,38 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use arboard::Clipboard;
 use tracing::info;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use pterminal_core::config::theme::Theme;
 use pterminal_core::terminal::{PtyHandle, TerminalEmulator};
 use pterminal_core::Config;
 use pterminal_render::Renderer;
+
+/// Text selection range in grid coordinates
+#[derive(Clone, Copy, PartialEq)]
+struct Selection {
+    start: (u16, u16), // (col, row)
+    end: (u16, u16),
+}
+
+impl Selection {
+    /// Normalize so start <= end (row-major order)
+    fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        if self.start.1 < self.end.1
+            || (self.start.1 == self.end.1 && self.start.0 <= self.end.0)
+        {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+}
 
 /// Main application state
 pub struct App {
@@ -31,7 +52,12 @@ struct RunningState {
     last_blink: Instant,
     blink_interval: Duration,
     scale_factor: f64,
-    last_content: String,
+    modifiers: ModifiersState,
+    clipboard: Option<Clipboard>,
+    // Mouse selection
+    selection: Option<Selection>,
+    mouse_pressed: bool,
+    last_mouse_pos: (f64, f64), // logical pixels
 }
 
 impl App {
@@ -45,7 +71,6 @@ impl App {
 
     pub fn run(self) -> Result<()> {
         let event_loop = EventLoop::new()?;
-
         let mut handler = AppHandler { app: self };
         event_loop.run_app(&mut handler)?;
         Ok(())
@@ -54,6 +79,54 @@ impl App {
 
 struct AppHandler {
     app: App,
+}
+
+impl AppHandler {
+    /// Convert logical pixel position to grid cell (col, row)
+    fn pixel_to_cell(state: &RunningState) -> (u16, u16) {
+        let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
+        let scale = state.scale_factor as f32;
+        let padding = 6.0 * scale;
+        let px = state.last_mouse_pos.0 as f32 * scale - padding;
+        let py = state.last_mouse_pos.1 as f32 * scale - padding;
+        let col = (px / cell_w).max(0.0) as u16;
+        let row = (py / cell_h).max(0.0) as u16;
+        let (_, grid_rows) = state.emulator.size();
+        let (grid_cols, _) = state.emulator.size();
+        (col.min(grid_cols.saturating_sub(1)), row.min(grid_rows.saturating_sub(1)))
+    }
+
+    /// Extract selected text from the grid
+    fn get_selected_text(state: &RunningState, theme: &Theme) -> Option<String> {
+        let sel = state.selection?;
+        let (start, end) = sel.normalized();
+        let grid = state.emulator.extract_grid(theme);
+
+        let mut text = String::new();
+        for row in start.1..=end.1 {
+            if row as usize >= grid.len() {
+                break;
+            }
+            let line = &grid[row as usize];
+            let col_start = if row == start.1 { start.0 as usize } else { 0 };
+            let col_end = if row == end.1 {
+                (end.0 as usize + 1).min(line.cells.len())
+            } else {
+                line.cells.len()
+            };
+            for col in col_start..col_end {
+                let c = line.cells[col].c;
+                text.push(if c == '\0' { ' ' } else { c });
+            }
+            // Trim trailing spaces on each line and add newline between rows
+            let trimmed = text.trim_end_matches(' ').len();
+            text.truncate(trimmed);
+            if row < end.1 {
+                text.push('\n');
+            }
+        }
+        if text.is_empty() { None } else { Some(text) }
+    }
 }
 
 impl ApplicationHandler for AppHandler {
@@ -72,7 +145,6 @@ impl ApplicationHandler for AppHandler {
         let size = window.inner_size();
         let font_size = self.app.config.font.size;
 
-        // Create renderer with scale factor
         let renderer = pollster::block_on(Renderer::new(
             window.clone(),
             size.width.max(1),
@@ -82,17 +154,14 @@ impl ApplicationHandler for AppHandler {
         ))
         .expect("create renderer");
 
-        // Calculate grid in physical pixels (scale-aware)
         let (cell_w, cell_h) = renderer.text_renderer.cell_size();
         let padding = (6.0 * scale_factor as f32) as u32;
         let cols = ((size.width - padding * 2) as f32 / cell_w).max(1.0) as u16;
         let rows = ((size.height - padding * 2) as f32 / cell_h).max(1.0) as u16;
 
         let emulator = TerminalEmulator::new(cols, rows);
-
         let shell = self.app.config.shell();
         let cwd = self.app.config.working_directory();
-
         let dirty = Arc::new(AtomicBool::new(true));
 
         let emulator_handle = emulator.clone_inner();
@@ -107,6 +176,7 @@ impl ApplicationHandler for AppHandler {
         .expect("spawn PTY");
 
         let blink_ms = self.app.config.cursor.blink_interval_ms;
+        let clipboard = Clipboard::new().ok();
         info!(cols, rows, %shell, scale_factor, "Terminal started");
 
         self.app.state = Some(RunningState {
@@ -119,7 +189,11 @@ impl ApplicationHandler for AppHandler {
             last_blink: Instant::now(),
             blink_interval: Duration::from_millis(blink_ms),
             scale_factor,
-            last_content: String::new(),
+            modifiers: ModifiersState::empty(),
+            clipboard,
+            selection: None,
+            mouse_pressed: false,
+            last_mouse_pos: (0.0, 0.0),
         });
     }
 
@@ -136,6 +210,10 @@ impl ApplicationHandler for AppHandler {
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
+            }
+
+            WindowEvent::ModifiersChanged(mods) => {
+                state.modifiers = mods.state();
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -160,30 +238,99 @@ impl ApplicationHandler for AppHandler {
                 state.dirty.store(true, Ordering::Relaxed);
             }
 
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    if let Some(bytes) = key_to_bytes(&event) {
-                        let _ = state.pty.write(&bytes);
-                        // Reset cursor blink on input
-                        state.cursor_visible = true;
-                        state.last_blink = Instant::now();
+            // Mouse events for selection
+            WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
+                match btn_state {
+                    ElementState::Pressed => {
+                        state.mouse_pressed = true;
+                        let cell = Self::pixel_to_cell(state);
+                        state.selection = Some(Selection { start: cell, end: cell });
+                        state.dirty.store(true, Ordering::Relaxed);
                     }
+                    ElementState::Released => {
+                        state.mouse_pressed = false;
+                        // If start == end, clear selection (it was just a click)
+                        if let Some(sel) = &state.selection {
+                            if sel.start == sel.end {
+                                state.selection = None;
+                                state.dirty.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                state.last_mouse_pos = (position.x, position.y);
+                if state.mouse_pressed {
+                    let cell = Self::pixel_to_cell(state);
+                    if let Some(sel) = &mut state.selection {
+                        if sel.end != cell {
+                            sel.end = cell;
+                            state.dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+
+                let super_key = state.modifiers.super_key();
+
+                // Cmd+C: Copy selection
+                if super_key {
+                    if let Key::Character(ref c) = event.logical_key {
+                        if c.as_str() == "c" {
+                            if let Some(text) =
+                                Self::get_selected_text(state, &self.app.theme)
+                            {
+                                if let Some(clip) = &mut state.clipboard {
+                                    let _ = clip.set_text(text);
+                                }
+                            }
+                            return;
+                        }
+                        // Cmd+V: Paste
+                        if c.as_str() == "v" {
+                            if let Some(clip) = &mut state.clipboard {
+                                if let Ok(text) = clip.get_text() {
+                                    let _ = state.pty.write(text.as_bytes());
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                // Clear selection on any other key press
+                if state.selection.is_some() {
+                    state.selection = None;
+                    state.dirty.store(true, Ordering::Relaxed);
+                }
+
+                if let Some(bytes) = key_to_bytes(&event) {
+                    let _ = state.pty.write(&bytes);
+                    state.cursor_visible = true;
+                    state.last_blink = Instant::now();
                 }
             }
 
             WindowEvent::RedrawRequested => {
                 let theme = &self.app.theme;
 
-                // Build text content with cursor
                 let grid = state.emulator.extract_grid(theme);
                 let cursor_pos = state.emulator.cursor_position();
-                let content = build_display_text(&grid, cursor_pos, state.cursor_visible);
+                let cursor_color = theme.colors.cursor;
 
-                // Only re-submit text to glyphon if content changed
-                if content != state.last_content {
-                    state.renderer.text_renderer.set_terminal_content(&content);
-                    state.last_content = content;
-                }
+                state.renderer.text_renderer.set_terminal_content(
+                    &grid,
+                    cursor_pos,
+                    state.cursor_visible,
+                    cursor_color,
+                );
 
                 state.renderer.text_renderer.prepare(
                     &state.renderer.device,
@@ -207,7 +354,9 @@ impl ApplicationHandler for AppHandler {
 
             // Cursor blink
             let now = Instant::now();
-            if self.app.config.cursor.blink && now.duration_since(state.last_blink) >= state.blink_interval {
+            if self.app.config.cursor.blink
+                && now.duration_since(state.last_blink) >= state.blink_interval
+            {
                 state.cursor_visible = !state.cursor_visible;
                 state.last_blink = now;
                 state.dirty.store(true, Ordering::Relaxed);
@@ -217,50 +366,11 @@ impl ApplicationHandler for AppHandler {
                 state.window.request_redraw();
             }
 
-            // Next wake: at blink time or 100ms (idle), whichever is sooner
             let next_blink = state.last_blink + state.blink_interval;
             let next_wake = next_blink.min(now + Duration::from_millis(100));
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next_wake));
         }
     }
-}
-
-/// Build display text from grid, inserting a block cursor character
-fn build_display_text(
-    grid: &[pterminal_core::terminal::GridLine],
-    cursor: (u16, u16),  // (col, row)
-    cursor_visible: bool,
-) -> String {
-    let mut text = String::with_capacity(grid.len() * 80);
-    let (cursor_col, cursor_row) = cursor;
-
-    for (row_idx, line) in grid.iter().enumerate() {
-        if row_idx > 0 {
-            text.push('\n');
-        }
-        for (col_idx, cell) in line.cells.iter().enumerate() {
-            if cursor_visible
-                && row_idx == cursor_row as usize
-                && col_idx == cursor_col as usize
-            {
-                // Render cursor as block character (▊)
-                text.push('█');
-            } else {
-                let c = cell.c;
-                text.push(if c == '\0' || c == ' ' { ' ' } else { c });
-            }
-        }
-        // Trim trailing spaces for cleaner rendering
-        let trimmed_len = text.trim_end_matches(' ').len();
-        // But keep at least up to the cursor column on cursor row
-        if row_idx == cursor_row as usize && cursor_visible {
-            let min_len = text.len() - line.cells.len() + cursor_col as usize + 1;
-            text.truncate(trimmed_len.max(min_len));
-        } else {
-            text.truncate(trimmed_len);
-        }
-    }
-    text
 }
 
 /// Convert winit key events to bytes for PTY input
@@ -288,7 +398,6 @@ fn key_to_bytes(event: &winit::event::KeyEvent) -> Option<Vec<u8>> {
             Some(bytes.to_vec())
         }
         Key::Character(_) => {
-            // Use event.text for the actual input (respects Shift, Ctrl, etc.)
             if let Some(text) = &event.text {
                 let s = text.as_str();
                 if !s.is_empty() {

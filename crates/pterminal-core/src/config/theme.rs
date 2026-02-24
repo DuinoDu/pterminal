@@ -18,7 +18,7 @@ pub struct ThemeColors {
     pub ansi: [RgbColor; 16],
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RgbColor {
     pub r: u8,
     pub g: u8,
