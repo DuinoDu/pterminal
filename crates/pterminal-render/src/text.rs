@@ -16,6 +16,10 @@ pub struct TextRenderer {
     buffer: Buffer,
     width: u32,
     height: u32,
+    scale_factor: f32,
+    font_size: f32,
+    line_height: f32,
+    content_dirty: bool,
 }
 
 impl TextRenderer {
@@ -25,7 +29,13 @@ impl TextRenderer {
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        scale_factor: f64,
+        font_size: f32,
     ) -> Self {
+        let scale = scale_factor as f32;
+        let scaled_font_size = font_size * scale;
+        let scaled_line_height = (font_size * 1.4) * scale;
+
         let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
@@ -34,7 +44,10 @@ impl TextRenderer {
             GlyphonTextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         let viewport = Viewport::new(device, &cache);
 
-        let mut buffer = Buffer::new(&mut font_system, Metrics::new(14.0, 18.0));
+        let mut buffer = Buffer::new(
+            &mut font_system,
+            Metrics::new(scaled_font_size, scaled_line_height),
+        );
         buffer.set_size(&mut font_system, Some(width as f32), Some(height as f32));
 
         Self {
@@ -46,6 +59,10 @@ impl TextRenderer {
             buffer,
             width,
             height,
+            scale_factor: scale,
+            font_size: scaled_font_size,
+            line_height: scaled_line_height,
+            content_dirty: true,
         }
     }
 
@@ -57,43 +74,31 @@ impl TextRenderer {
             Some(width as f32),
             Some(height as f32),
         );
+        self.content_dirty = true;
     }
 
-    /// Set font metrics (size and line height)
-    pub fn set_font_metrics(&mut self, font_size: f32, line_height: f32) {
+    pub fn update_scale_factor(&mut self, scale_factor: f64, font_size: f32) {
+        let scale = scale_factor as f32;
+        self.scale_factor = scale;
+        self.font_size = font_size * scale;
+        self.line_height = (font_size * 1.4) * scale;
         self.buffer.set_metrics(
             &mut self.font_system,
-            Metrics::new(font_size, line_height),
+            Metrics::new(self.font_size, self.line_height),
         );
+        self.content_dirty = true;
     }
 
-    /// Set the text content with per-character coloring
-    pub fn set_terminal_content(&mut self, lines: &[TerminalLine]) {
-        // Build rich text spans for each line
-        let mut full_text = String::new();
-        let mut attrs_list = Vec::new();
-
-        for (line_idx, line) in lines.iter().enumerate() {
-            if line_idx > 0 {
-                full_text.push('\n');
-            }
-            for cell in &line.cells {
-                let start = full_text.len();
-                full_text.push(cell.c);
-                let _end = full_text.len();
-                attrs_list.push((start, cell.fg));
-            }
-        }
-
-        // Simple approach: set text with default attrs, coloring will be handled
-        // via per-line rich text in future iterations
+    /// Set the text content — only reshapes if content actually changed
+    pub fn set_terminal_content(&mut self, text: &str) {
         self.buffer.set_text(
             &mut self.font_system,
-            &full_text,
+            text,
             Attrs::new().family(Family::Monospace),
             Shaping::Advanced,
         );
         self.buffer.shape_until_scroll(&mut self.font_system, false);
+        self.content_dirty = true;
     }
 
     /// Prepare and render text
@@ -104,6 +109,11 @@ impl TextRenderer {
     /// Post-render cleanup: trim atlas
     pub fn post_render(&mut self) {
         self.atlas.trim();
+        self.content_dirty = false;
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.content_dirty
     }
 
     /// Prepare text for rendering (call before render_frame's render pass)
@@ -119,10 +129,12 @@ impl TextRenderer {
         };
         self.viewport.update(queue, resolution);
 
+        let padding = 6.0 * self.scale_factor;
+
         let text_areas = [TextArea {
             buffer: &self.buffer,
-            left: 4.0,
-            top: 4.0,
+            left: padding,
+            top: padding,
             scale: 1.0,
             bounds: TextBounds {
                 left: 0,
@@ -145,18 +157,13 @@ impl TextRenderer {
         );
     }
 
-    /// Access font system for metrics calculation
-    pub fn font_system(&self) -> &FontSystem {
-        &self.font_system
+    /// Cell dimensions in physical pixels
+    pub fn cell_size(&self) -> (f32, f32) {
+        (self.font_size * 0.6, self.line_height)
     }
 
-    /// Calculate cell dimensions based on current font
-    pub fn cell_size(&mut self) -> (f32, f32) {
-        let metrics = self.buffer.metrics();
-        // Approximate cell width from font metrics
-        let cell_width = metrics.font_size * 0.6; // Monospace approximation
-        let cell_height = metrics.line_height;
-        (cell_width, cell_height)
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
     }
 }
 

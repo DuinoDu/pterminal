@@ -84,6 +84,13 @@ impl TerminalEmulator {
         }
     }
 
+    /// Get cursor position as (col, row)
+    pub fn cursor_position(&self) -> (u16, u16) {
+        let term = self.term.lock().unwrap();
+        let cursor = term.grid().cursor.point;
+        (cursor.column.0 as u16, cursor.line.0 as u16)
+    }
+
     /// Extract terminal grid content for rendering
     pub fn extract_grid(&self, theme: &Theme) -> Vec<GridLine> {
         use alacritty_terminal::index::{Column, Line};

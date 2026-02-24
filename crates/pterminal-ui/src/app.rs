@@ -13,7 +13,6 @@ use pterminal_core::config::theme::Theme;
 use pterminal_core::terminal::{PtyHandle, TerminalEmulator};
 use pterminal_core::Config;
 use pterminal_render::Renderer;
-use pterminal_render::grid::grid_to_render_lines;
 
 /// Main application state
 pub struct App {
@@ -28,6 +27,11 @@ struct RunningState {
     emulator: TerminalEmulator,
     pty: PtyHandle,
     dirty: Arc<AtomicBool>,
+    cursor_visible: bool,
+    last_blink: Instant,
+    blink_interval: Duration,
+    scale_factor: f64,
+    last_content: String,
 }
 
 impl App {
@@ -42,9 +46,7 @@ impl App {
     pub fn run(self) -> Result<()> {
         let event_loop = EventLoop::new()?;
 
-        let mut handler = AppHandler {
-            app: self,
-        };
+        let mut handler = AppHandler { app: self };
         event_loop.run_app(&mut handler)?;
         Ok(())
     }
@@ -62,31 +64,32 @@ impl ApplicationHandler for AppHandler {
 
         let attrs = WindowAttributes::default()
             .with_title("pterminal")
-            .with_inner_size(winit::dpi::LogicalSize::new(1024.0, 768.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0));
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
+        let scale_factor = window.scale_factor();
         let size = window.inner_size();
+        let font_size = self.app.config.font.size;
 
-        // Create renderer (blocking on async)
+        // Create renderer with scale factor
         let renderer = pollster::block_on(Renderer::new(
             window.clone(),
             size.width.max(1),
             size.height.max(1),
+            scale_factor,
+            font_size,
         ))
         .expect("create renderer");
 
-        // Calculate terminal grid size from window
-        let font_size = self.app.config.font.size;
-        let cell_width = (font_size * 0.6) as u16;
-        let cell_height = (font_size * 1.3) as u16;
-        let cols = (size.width as u16 / cell_width).max(1);
-        let rows = (size.height as u16 / cell_height).max(1);
+        // Calculate grid in physical pixels (scale-aware)
+        let (cell_w, cell_h) = renderer.text_renderer.cell_size();
+        let padding = (6.0 * scale_factor as f32) as u32;
+        let cols = ((size.width - padding * 2) as f32 / cell_w).max(1.0) as u16;
+        let rows = ((size.height - padding * 2) as f32 / cell_h).max(1.0) as u16;
 
-        // Create terminal emulator
         let emulator = TerminalEmulator::new(cols, rows);
 
-        // Spawn PTY
         let shell = self.app.config.shell();
         let cwd = self.app.config.working_directory();
 
@@ -98,12 +101,13 @@ impl ApplicationHandler for AppHandler {
 
         let pty = PtyHandle::spawn(&shell, &cwd, cols, rows, move |data| {
             emulator_handle.process(data);
-            dirty_for_pty.store(true, Ordering::Relaxed);
+            dirty_for_pty.store(true, Ordering::Release);
             window_for_redraw.request_redraw();
         })
         .expect("spawn PTY");
 
-        info!(cols, rows, %shell, "Terminal started");
+        let blink_ms = self.app.config.cursor.blink_interval_ms;
+        info!(cols, rows, %shell, scale_factor, "Terminal started");
 
         self.app.state = Some(RunningState {
             window,
@@ -111,6 +115,11 @@ impl ApplicationHandler for AppHandler {
             emulator,
             pty,
             dirty,
+            cursor_visible: true,
+            last_blink: Instant::now(),
+            blink_interval: Duration::from_millis(blink_ms),
+            scale_factor,
+            last_content: String::new(),
         });
     }
 
@@ -129,14 +138,22 @@ impl ApplicationHandler for AppHandler {
                 event_loop.exit();
             }
 
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                state.scale_factor = scale_factor;
+                state.renderer.text_renderer.update_scale_factor(
+                    scale_factor,
+                    self.app.config.font.size,
+                );
+                state.dirty.store(true, Ordering::Relaxed);
+            }
+
             WindowEvent::Resized(new_size) => {
                 state.renderer.resize(new_size.width, new_size.height);
 
-                let font_size = self.app.config.font.size;
-                let cell_width = (font_size * 0.6) as u16;
-                let cell_height = (font_size * 1.3) as u16;
-                let cols = (new_size.width as u16 / cell_width).max(1);
-                let rows = (new_size.height as u16 / cell_height).max(1);
+                let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
+                let padding = (6.0 * state.scale_factor as f32) as u32;
+                let cols = ((new_size.width - padding * 2) as f32 / cell_w).max(1.0) as u16;
+                let rows = ((new_size.height - padding * 2) as f32 / cell_h).max(1.0) as u16;
 
                 state.emulator.resize(cols, rows);
                 let _ = state.pty.resize(cols, rows);
@@ -144,31 +161,39 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed || event.state == ElementState::Released {
-                    // Only handle press (and repeat, which winit sends as Pressed)
-                    if event.state == ElementState::Pressed {
-                        if let Some(bytes) = key_to_bytes(&event) {
-                            let _ = state.pty.write(&bytes);
-                            state.window.request_redraw();
-                        }
+                if event.state == ElementState::Pressed {
+                    if let Some(bytes) = key_to_bytes(&event) {
+                        let _ = state.pty.write(&bytes);
+                        // Reset cursor blink on input
+                        state.cursor_visible = true;
+                        state.last_blink = Instant::now();
                     }
                 }
             }
 
             WindowEvent::RedrawRequested => {
                 let theme = &self.app.theme;
+
+                // Build text content with cursor
                 let grid = state.emulator.extract_grid(theme);
-                let lines = grid_to_render_lines(&grid);
-                state.renderer.text_renderer.set_terminal_content(&lines);
+                let cursor_pos = state.emulator.cursor_position();
+                let content = build_display_text(&grid, cursor_pos, state.cursor_visible);
+
+                // Only re-submit text to glyphon if content changed
+                if content != state.last_content {
+                    state.renderer.text_renderer.set_terminal_content(&content);
+                    state.last_content = content;
+                }
+
                 state.renderer.text_renderer.prepare(
                     &state.renderer.device,
                     &state.renderer.queue,
                     theme.colors.foreground,
                 );
 
-                let _ = state.renderer.render_frame(theme.colors.background, |_text| {
-                    // Text already prepared above
-                });
+                let _ = state
+                    .renderer
+                    .render_frame(theme.colors.background, |_| {});
                 state.dirty.store(false, Ordering::Relaxed);
             }
 
@@ -178,34 +203,68 @@ impl ApplicationHandler for AppHandler {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.app.state {
-            // Poll terminal events
-            let events = state.emulator.poll_events();
-            if !events.is_empty() {
+            let _ = state.emulator.poll_events();
+
+            // Cursor blink
+            let now = Instant::now();
+            if self.app.config.cursor.blink && now.duration_since(state.last_blink) >= state.blink_interval {
+                state.cursor_visible = !state.cursor_visible;
+                state.last_blink = now;
                 state.dirty.store(true, Ordering::Relaxed);
             }
 
-            if state.dirty.load(Ordering::Relaxed) {
+            if state.dirty.load(Ordering::Acquire) {
                 state.window.request_redraw();
             }
 
-            // Wake up periodically to check for PTY output (16ms ≈ 60fps)
-            event_loop.set_control_flow(
-                winit::event_loop::ControlFlow::WaitUntil(
-                    Instant::now() + Duration::from_millis(16),
-                ),
-            );
+            // Next wake: at blink time or 100ms (idle), whichever is sooner
+            let next_blink = state.last_blink + state.blink_interval;
+            let next_wake = next_blink.min(now + Duration::from_millis(100));
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next_wake));
         }
     }
 }
 
+/// Build display text from grid, inserting a block cursor character
+fn build_display_text(
+    grid: &[pterminal_core::terminal::GridLine],
+    cursor: (u16, u16),  // (col, row)
+    cursor_visible: bool,
+) -> String {
+    let mut text = String::with_capacity(grid.len() * 80);
+    let (cursor_col, cursor_row) = cursor;
+
+    for (row_idx, line) in grid.iter().enumerate() {
+        if row_idx > 0 {
+            text.push('\n');
+        }
+        for (col_idx, cell) in line.cells.iter().enumerate() {
+            if cursor_visible
+                && row_idx == cursor_row as usize
+                && col_idx == cursor_col as usize
+            {
+                // Render cursor as block character (▊)
+                text.push('█');
+            } else {
+                let c = cell.c;
+                text.push(if c == '\0' || c == ' ' { ' ' } else { c });
+            }
+        }
+        // Trim trailing spaces for cleaner rendering
+        let trimmed_len = text.trim_end_matches(' ').len();
+        // But keep at least up to the cursor column on cursor row
+        if row_idx == cursor_row as usize && cursor_visible {
+            let min_len = text.len() - line.cells.len() + cursor_col as usize + 1;
+            text.truncate(trimmed_len.max(min_len));
+        } else {
+            text.truncate(trimmed_len);
+        }
+    }
+    text
+}
+
 /// Convert winit key events to bytes for PTY input
 fn key_to_bytes(event: &winit::event::KeyEvent) -> Option<Vec<u8>> {
-    
-
-    // Check if Ctrl is held (for Ctrl+C, Ctrl+D, etc.)
-    // winit puts the text with modifiers applied in event.text
-    // but Ctrl+key combos need special handling
-
     match &event.logical_key {
         Key::Named(named) => {
             let bytes: &[u8] = match named {
@@ -228,24 +287,15 @@ fn key_to_bytes(event: &winit::event::KeyEvent) -> Option<Vec<u8>> {
             };
             Some(bytes.to_vec())
         }
-        Key::Character(c) => {
-            // Use event.text for the actual input (respects modifiers like Shift)
+        Key::Character(_) => {
+            // Use event.text for the actual input (respects Shift, Ctrl, etc.)
             if let Some(text) = &event.text {
                 let s = text.as_str();
                 if !s.is_empty() {
                     return Some(s.as_bytes().to_vec());
                 }
             }
-            // Fallback: handle Ctrl+key by checking if the character is a-z
-            // and the text field is empty (macOS may not provide text for Ctrl combos)
-            let ch = c.as_str().chars().next()?;
-            if ch.is_ascii_lowercase() {
-                // Could be Ctrl+key — but we can't tell without modifier state here.
-                // Just pass the character through as-is.
-                Some(c.as_str().as_bytes().to_vec())
-            } else {
-                Some(c.as_str().as_bytes().to_vec())
-            }
+            None
         }
         _ => None,
     }

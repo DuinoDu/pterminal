@@ -18,6 +18,8 @@ impl Renderer {
         window: impl Into<SurfaceTarget<'static>>,
         width: u32,
         height: u32,
+        scale_factor: f64,
+        font_size: f32,
     ) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -65,7 +67,9 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        let text_renderer = TextRenderer::new(&device, &queue, surface_format, width, height);
+        let text_renderer = TextRenderer::new(
+            &device, &queue, surface_format, width, height, scale_factor, font_size,
+        );
 
         Ok(Self {
             device,
