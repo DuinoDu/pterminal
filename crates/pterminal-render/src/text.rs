@@ -73,7 +73,8 @@ pub struct TextRenderer {
 
 /// Tab bar state
 struct TabBar {
-    buffer: Buffer,
+    /// Per-tab text buffers with their x-offset
+    tab_buffers: Vec<(Buffer, f32)>, // (buffer, x_offset)
     height: f32, // physical pixels
     bg_rects: Vec<crate::bg::BgRect>,
     content_hash: u64,
@@ -316,22 +317,24 @@ impl TextRenderer {
 
         let mut text_areas: Vec<TextArea<'_>> = Vec::new();
 
-        // Tab bar text
+        // Tab bar text (per-tab buffers)
         if let Some(ref tb) = self.tab_bar {
-            text_areas.push(TextArea {
-                buffer: &tb.buffer,
-                left: 0.0,
-                top: 0.0,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: 0,
-                    right: self.width as i32,
-                    bottom: tb.height as i32,
-                },
-                default_color: default_glyphon_color,
-                custom_glyphs: &[],
-            });
+            for (buffer, x_offset) in &tb.tab_buffers {
+                text_areas.push(TextArea {
+                    buffer,
+                    left: *x_offset,
+                    top: 0.0,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: *x_offset as i32,
+                        top: 0,
+                        right: self.width as i32,
+                        bottom: tb.height as i32,
+                    },
+                    default_color: default_glyphon_color,
+                    custom_glyphs: &[],
+                });
+            }
         }
 
         // Pane text
@@ -541,36 +544,30 @@ impl TextRenderer {
             }
         }
 
-        // Build rich text: "  Tab 1  |  Tab 2  |  Tab 3  "
+        // Build per-tab text buffers, each positioned at its tab region
         let metrics = Metrics::new(tab_font_size, tab_height);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        buffer.set_size(&mut self.font_system, Some(self.width as f32), Some(tab_height));
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        let mut tab_buffers = Vec::with_capacity(tabs.len());
 
-        let mut text = String::new();
-        let mut spans = Vec::new();
         for (i, (label, active)) in tabs.iter().enumerate() {
-            if i > 0 {
-                let sep_start = text.len();
-                text.push_str(" │ ");
-                spans.push((sep_start, text.len(), bar_bg)); // dim separator
-            }
-            let start = text.len();
-            text.push_str(&format!(" {} ", label));
-            spans.push((start, text.len(), if *active { active_fg } else { fg }));
+            let mut buffer = Buffer::new(&mut self.font_system, metrics);
+            buffer.set_size(&mut self.font_system, Some(tab_width), Some(tab_height));
+            let color = if *active { active_fg } else { fg };
+            let text = format!(" {} ", label);
+            let attrs = default_attrs.color(Color::rgb(color.r, color.g, color.b));
+            buffer.set_rich_text(
+                &mut self.font_system,
+                [(&text as &str, attrs)],
+                default_attrs,
+                Shaping::Advanced,
+            );
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            let x_offset = i as f32 * tab_width;
+            tab_buffers.push((buffer, x_offset));
         }
 
-        let default_attrs = Attrs::new().family(Family::Monospace);
-        let rich: Vec<(&str, Attrs)> = spans
-            .iter()
-            .map(|(s, e, color)| {
-                (&text[*s..*e], default_attrs.color(Color::rgb(color.r, color.g, color.b)))
-            })
-            .collect();
-        buffer.set_rich_text(&mut self.font_system, rich, default_attrs, Shaping::Advanced);
-        buffer.shape_until_scroll(&mut self.font_system, false);
-
         self.tab_bar = Some(TabBar {
-            buffer,
+            tab_buffers,
             height: tab_height,
             bg_rects,
             content_hash: hash,

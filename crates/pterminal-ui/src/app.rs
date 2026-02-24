@@ -66,7 +66,7 @@ struct RunningState {
     // Mouse selection
     selection: Option<Selection>,
     mouse_pressed: bool,
-    last_mouse_pos: (f64, f64), // physical pixels
+    last_mouse_pos: (f64, f64), // as reported by CursorMoved (may need scaling)
     // Click counting for double/triple click
     last_click_time: Instant,
     last_click_pos: (u16, u16),
@@ -118,15 +118,21 @@ struct AppHandler {
 }
 
 impl AppHandler {
-    /// Convert logical pixel position to grid cell (col, row) for the active pane
+    /// Get mouse position in physical pixels (renderer coordinate space)
+    fn mouse_physical(state: &RunningState) -> (f32, f32) {
+        let scale = state.scale_factor as f32;
+        (state.last_mouse_pos.0 as f32 * scale, state.last_mouse_pos.1 as f32 * scale)
+    }
+
+    /// Convert mouse position to grid cell (col, row) for the active pane
     fn pixel_to_cell(state: &RunningState) -> (u16, u16) {
         let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
         let scale = state.scale_factor as f32;
         let padding = 6.0 * scale;
         let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
-        // last_mouse_pos is already in physical pixels (PhysicalPosition from winit)
-        let px = state.last_mouse_pos.0 as f32 - padding;
-        let py = state.last_mouse_pos.1 as f32 - padding - tab_bar_h;
+        let (mx, my) = Self::mouse_physical(state);
+        let px = mx - padding;
+        let py = my - padding - tab_bar_h;
         let col = (px / cell_w).max(0.0) as u16;
         let row = (py / cell_h).max(0.0) as u16;
 
@@ -496,9 +502,7 @@ impl ApplicationHandler for AppHandler {
             // Mouse events for selection
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
                 let scale = state.scale_factor as f32;
-                // last_mouse_pos is already physical pixels
-                let phys_x = state.last_mouse_pos.0 as f32;
-                let phys_y = state.last_mouse_pos.1 as f32;
+                let (phys_x, phys_y) = Self::mouse_physical(state);
 
                 // Check context menu click
                 if let Some(ref menu) = state.context_menu {
@@ -631,8 +635,7 @@ impl ApplicationHandler for AppHandler {
             // Right-click context menu
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Right, .. } => {
                 if btn_state == ElementState::Pressed {
-                    let phys_x = state.last_mouse_pos.0 as f32;
-                    let phys_y = state.last_mouse_pos.1 as f32;
+                    let (phys_x, phys_y) = Self::mouse_physical(state);
                     let has_selection = state.selection.is_some();
                     let mut items = Vec::new();
                     if has_selection {
