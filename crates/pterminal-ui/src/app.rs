@@ -140,20 +140,67 @@ impl AppHandler {
         (state.last_mouse_pos.0 as f32, state.last_mouse_pos.1 as f32)
     }
 
-    /// Convert mouse position to grid cell (col, row) for the active pane
-    fn pixel_to_cell(state: &RunningState) -> (u16, u16) {
-        let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
+    fn sidebar_width(config: &Config, scale_factor: f64) -> f32 {
+        (config.sidebar.width as f32 * scale_factor as f32).max(0.0)
+    }
+
+    fn pane_pixel_rect(state: &RunningState, config: &Config, pane_id: PaneId) -> Option<PixelRect> {
         let scale = state.scale_factor as f32;
-        let padding = 6.0 * scale;
+        let w = state.renderer.width();
+        let h = state.renderer.height();
         let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
+        let sidebar_w = Self::sidebar_width(config, state.scale_factor);
+        state
+            .workspace_mgr
+            .active_workspace()
+            .split_tree
+            .layout()
+            .into_iter()
+            .find(|(id, _)| *id == pane_id)
+            .map(|(_, rect)| Self::pane_to_pixel_rect(&rect, w, h, scale, tab_bar_h, sidebar_w))
+    }
+
+    fn pane_at_pixel(state: &RunningState, config: &Config, x: f32, y: f32) -> Option<PaneId> {
+        let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
+        if y < tab_bar_h {
+            return None;
+        }
+        let scale = state.scale_factor as f32;
+        let w = state.renderer.width();
+        let h = state.renderer.height();
+        let sidebar_w = Self::sidebar_width(config, state.scale_factor);
+        state
+            .workspace_mgr
+            .active_workspace()
+            .split_tree
+            .layout()
+            .into_iter()
+            .find_map(|(pane_id, pane_rect)| {
+                let px = Self::pane_to_pixel_rect(&pane_rect, w, h, scale, tab_bar_h, sidebar_w);
+                let in_x = x >= px.x && x < px.x + px.w;
+                let in_y = y >= px.y && y < px.y + px.h;
+                if in_x && in_y {
+                    Some(pane_id)
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Convert mouse position to grid cell (col, row) for a specific pane
+    fn pixel_to_cell(state: &RunningState, config: &Config, pane_id: PaneId) -> (u16, u16) {
+        let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
         let (mx, my) = Self::mouse_physical(state);
-        let px = mx - padding;
-        let py = my - padding - tab_bar_h;
+        let pane_rect = Self::pane_pixel_rect(state, config, pane_id);
+        let (px, py) = if let Some(rect) = pane_rect {
+            (mx - rect.x, my - rect.y)
+        } else {
+            (mx, my)
+        };
         let col = (px / cell_w).max(0.0) as u16;
         let row = (py / cell_h).max(0.0) as u16;
 
-        let active_pane = state.workspace_mgr.active_workspace().active_pane();
-        if let Some(ps) = state.pane_states.get(&active_pane) {
+        if let Some(ps) = state.pane_states.get(&pane_id) {
             let (grid_cols, grid_rows) = ps.emulator.size();
             (col.min(grid_cols.saturating_sub(1)), row.min(grid_rows.saturating_sub(1)))
         } else {
@@ -321,11 +368,11 @@ impl AppHandler {
     }
 
     /// Calculate cols/rows from a physical-pixel pane rect
-    fn rect_to_cols_rows(renderer: &Renderer, scale_factor: f64) -> (u16, u16) {
+    fn rect_to_cols_rows(renderer: &Renderer, scale_factor: f64, sidebar_w: f32) -> (u16, u16) {
         let (cell_w, cell_h) = renderer.text_renderer.cell_size();
         let padding = (6.0 * scale_factor as f32) as u32;
-        let w = renderer.width();
-        let h = renderer.height();
+        let w = (renderer.width() as f32 - sidebar_w).max(1.0) as u32;
+        let h = (renderer.height() as f32 - renderer.text_renderer.tab_bar_height()).max(1.0) as u32;
         let cols = ((w - padding * 2) as f32 / cell_w).max(1.0) as u16;
         let rows = ((h - padding * 2) as f32 / cell_h).max(1.0) as u16;
         (cols, rows)
@@ -348,12 +395,13 @@ impl AppHandler {
         window_h: u32,
         scale: f32,
         tab_bar_h: f32,
+        sidebar_w: f32,
     ) -> PixelRect {
-        let content_w = window_w as f32;
+        let content_w = (window_w as f32 - sidebar_w).max(1.0);
         let content_h = window_h as f32 - tab_bar_h;
         let padding = 6.0 * scale;
         PixelRect {
-            x: pane_rect.x * content_w + padding,
+            x: sidebar_w + pane_rect.x * content_w + padding,
             y: pane_rect.y * content_h + padding + tab_bar_h,
             w: pane_rect.width * content_w - padding * 2.0,
             h: pane_rect.height * content_h - padding * 2.0,
@@ -372,9 +420,10 @@ impl AppHandler {
     }
 
     /// Update IME candidate window position to match the terminal cursor
-    fn update_ime_cursor_area(state: &RunningState) {
+    fn update_ime_cursor_area(state: &RunningState, config: &Config) {
         let active = state.workspace_mgr.active_workspace().active_pane();
         let scale = state.scale_factor as f32;
+        let sidebar_w = Self::sidebar_width(config, state.scale_factor);
         let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
 
         if let Some(ps) = state.pane_states.get(&active) {
@@ -385,7 +434,14 @@ impl AppHandler {
             if let Some((_, rect)) = pane_rect {
                 let w = state.renderer.width();
                 let h = state.renderer.height();
-                let pr = Self::pane_to_pixel_rect(rect, w, h, scale, state.renderer.text_renderer.tab_bar_height());
+                let pr = Self::pane_to_pixel_rect(
+                    rect,
+                    w,
+                    h,
+                    scale,
+                    state.renderer.text_renderer.tab_bar_height(),
+                    sidebar_w,
+                );
 
                 // Cursor top-left position in physical pixels;
                 // macOS places the candidate window just below this area
@@ -510,7 +566,8 @@ impl AppHandler {
             }
             "workspace.new" | "new-workspace" => {
                 let (ws_id, pane_id) = state.workspace_mgr.add_workspace();
-                let (cols, rows) = Self::rect_to_cols_rows(&state.renderer, state.scale_factor);
+                let sidebar_w = Self::sidebar_width(config, state.scale_factor);
+                let (cols, rows) = Self::rect_to_cols_rows(&state.renderer, state.scale_factor, sidebar_w);
                 let ps = Self::spawn_pane(config, pane_id, cols, rows, &state.window);
                 state.pane_states.insert(pane_id, ps);
                 Self::update_title(state);
@@ -668,7 +725,8 @@ impl ApplicationHandler for AppHandler {
         ))
         .expect("create renderer");
 
-        let (cols, rows) = Self::rect_to_cols_rows(&renderer, scale_factor);
+        let sidebar_w = Self::sidebar_width(&self.app.config, scale_factor);
+        let (cols, rows) = Self::rect_to_cols_rows(&renderer, scale_factor, sidebar_w);
 
         // WorkspaceManager starts with workspace 0, pane 0
         let workspace_mgr = WorkspaceManager::new();
@@ -761,7 +819,7 @@ impl ApplicationHandler for AppHandler {
                     winit::event::Ime::Enabled => {
                         state.ime_active = true;
                         // Set initial IME cursor area at current cursor position
-                        Self::update_ime_cursor_area(state);
+                        Self::update_ime_cursor_area(state, &self.app.config);
                     }
                     winit::event::Ime::Disabled => {
                         state.ime_active = false;
@@ -775,7 +833,7 @@ impl ApplicationHandler for AppHandler {
                     }
                     winit::event::Ime::Preedit(_, _) => {
                         // Update candidate window position during composition
-                        Self::update_ime_cursor_area(state);
+                        Self::update_ime_cursor_area(state, &self.app.config);
                     }
                 }
             }
@@ -798,11 +856,19 @@ impl ApplicationHandler for AppHandler {
                 let scale = state.scale_factor as f32;
                 let w = new_size.width;
                 let h = new_size.height;
+                let sidebar_w = Self::sidebar_width(&self.app.config, state.scale_factor);
 
                 // Resize all panes in the active workspace based on their layout rects
                 let layout = state.workspace_mgr.active_workspace().split_tree.layout();
                 for (pane_id, pane_rect) in &layout {
-                    let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale, state.renderer.text_renderer.tab_bar_height());
+                    let px_rect = Self::pane_to_pixel_rect(
+                        pane_rect,
+                        w,
+                        h,
+                        scale,
+                        state.renderer.text_renderer.tab_bar_height(),
+                        sidebar_w,
+                    );
                     let (cols, rows) = Self::pixel_rect_to_cols_rows(&px_rect, &state.renderer);
                     if let Some(ps) = state.pane_states.get(pane_id) {
                         ps.emulator.resize(cols, rows);
@@ -891,8 +957,20 @@ impl ApplicationHandler for AppHandler {
 
                 match btn_state {
                     ElementState::Pressed => {
+                        let Some(clicked_pane) = Self::pane_at_pixel(state, &self.app.config, phys_x, phys_y) else {
+                            return;
+                        };
+                        let prev_active = state.workspace_mgr.active_workspace().active_pane();
+                        if prev_active != clicked_pane {
+                            state.workspace_mgr.active_workspace_mut().set_active_pane(clicked_pane);
+                            for ps in state.pane_states.values() {
+                                ps.dirty.store(true, Ordering::Relaxed);
+                            }
+                        }
+
                         state.mouse_pressed = true;
-                        let cell = Self::pixel_to_cell(state);
+                        let active = state.workspace_mgr.active_workspace().active_pane();
+                        let cell = Self::pixel_to_cell(state, &self.app.config, active);
                         let now = Instant::now();
                         let double_click_threshold = Duration::from_millis(400);
                         // Count rapid clicks at same position
@@ -920,7 +998,6 @@ impl ApplicationHandler for AppHandler {
                                 state.selection = Some(Selection { start: cell, end: cell });
                             }
                         }
-                        let active = state.workspace_mgr.active_workspace().active_pane();
                         if let Some(ps) = state.pane_states.get(&active) {
                             ps.dirty.store(true, Ordering::Relaxed);
                         }
@@ -951,6 +1028,11 @@ impl ApplicationHandler for AppHandler {
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Right, .. } => {
                 if btn_state == ElementState::Pressed {
                     let (phys_x, phys_y) = Self::mouse_physical(state);
+                    if let Some(clicked_pane) = Self::pane_at_pixel(state, &self.app.config, phys_x, phys_y) {
+                        state.workspace_mgr.active_workspace_mut().set_active_pane(clicked_pane);
+                    } else {
+                        return;
+                    }
                     let has_selection = state.selection.is_some();
                     let mut items = Vec::new();
                     if has_selection {
@@ -970,11 +1052,11 @@ impl ApplicationHandler for AppHandler {
                 state.last_mouse_pos = (position.x, position.y);
                 // Only drag-extend for single-click selections (not word/line)
                 if state.mouse_pressed && state.click_count <= 1 {
-                    let cell = Self::pixel_to_cell(state);
+                    let active = state.workspace_mgr.active_workspace().active_pane();
+                    let cell = Self::pixel_to_cell(state, &self.app.config, active);
                     if let Some(sel) = &mut state.selection {
                         if sel.end != cell {
                             sel.end = cell;
-                            let active = state.workspace_mgr.active_workspace().active_pane();
                             if let Some(ps) = state.pane_states.get(&active) {
                                 ps.dirty.store(true, Ordering::Relaxed);
                             }
@@ -1038,7 +1120,8 @@ impl ApplicationHandler for AppHandler {
                             // Cmd+T: New workspace (tab)
                             "t" => {
                                 let (_ws_id, pane_id) = state.workspace_mgr.add_workspace();
-                                let (cols, rows) = Self::rect_to_cols_rows(&state.renderer, state.scale_factor);
+                                let sidebar_w = Self::sidebar_width(&self.app.config, state.scale_factor);
+                                let (cols, rows) = Self::rect_to_cols_rows(&state.renderer, state.scale_factor, sidebar_w);
                                 let ps = Self::spawn_pane(&self.app.config, pane_id, cols, rows, &state.window);
                                 state.pane_states.insert(pane_id, ps);
                                 Self::update_title(state);
@@ -1081,12 +1164,20 @@ impl ApplicationHandler for AppHandler {
                                 let scale = state.scale_factor as f32;
                                 let w = state.renderer.width();
                                 let h = state.renderer.height();
+                                let sidebar_w = Self::sidebar_width(&self.app.config, state.scale_factor);
                                 let layout = state.workspace_mgr.active_workspace().split_tree.layout();
                                 let (cols, rows) = if let Some((_, pr)) = layout.iter().find(|(id, _)| *id == new_pane_id) {
-                                    let px = Self::pane_to_pixel_rect(pr, w, h, scale, state.renderer.text_renderer.tab_bar_height());
+                                    let px = Self::pane_to_pixel_rect(
+                                        pr,
+                                        w,
+                                        h,
+                                        scale,
+                                        state.renderer.text_renderer.tab_bar_height(),
+                                        sidebar_w,
+                                    );
                                     Self::pixel_rect_to_cols_rows(&px, &state.renderer)
                                 } else {
-                                    Self::rect_to_cols_rows(&state.renderer, state.scale_factor)
+                                    Self::rect_to_cols_rows(&state.renderer, state.scale_factor, sidebar_w)
                                 };
 
                                 let ps = Self::spawn_pane(&self.app.config, new_pane_id, cols, rows, &state.window);
@@ -1094,7 +1185,14 @@ impl ApplicationHandler for AppHandler {
 
                                 // Also resize the original pane since it shrunk
                                 if let Some((_, pr)) = layout.iter().find(|(id, _)| *id == active_pane) {
-                                    let px = Self::pane_to_pixel_rect(pr, w, h, scale, state.renderer.text_renderer.tab_bar_height());
+                                    let px = Self::pane_to_pixel_rect(
+                                        pr,
+                                        w,
+                                        h,
+                                        scale,
+                                        state.renderer.text_renderer.tab_bar_height(),
+                                        sidebar_w,
+                                    );
                                     let (c, r) = Self::pixel_rect_to_cols_rows(&px, &state.renderer);
                                     if let Some(ops) = state.pane_states.get(&active_pane) {
                                         ops.emulator.resize(c, r);
@@ -1215,51 +1313,10 @@ impl ApplicationHandler for AppHandler {
                 let h = state.renderer.height();
 
                 // Update tab bar
+                let tab_count = state.workspace_mgr.workspace_count();
                 let active_idx = state.workspace_mgr.active_index();
-                let unread_count = state.notifications.unread_count();
-                let tabs: Vec<(String, bool)> = state
-                    .workspace_mgr
-                    .workspaces()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, ws)| {
-                        let mut label = format!("Tab {}", i + 1);
-                        if let Some(ps) = state.pane_states.get(&ws.active_pane()) {
-                            if self.app.config.sidebar.show_cwd {
-                                if let Some(cwd_name) = ps.cwd.file_name().and_then(|n| n.to_str()) {
-                                    label.push_str(" | ");
-                                    label.push_str(cwd_name);
-                                } else if let Some(cwd) = ps.cwd.to_str() {
-                                    label.push_str(" | ");
-                                    label.push_str(cwd);
-                                }
-                            }
-                            if self.app.config.sidebar.show_git_branch {
-                                if let Some(branch) = &ps.git_branch {
-                                    label.push_str(" | git:");
-                                    label.push_str(branch);
-                                }
-                            }
-                            if self.app.config.sidebar.show_ports && !ps.detected_ports.is_empty() {
-                                let shown: Vec<String> = ps
-                                    .detected_ports
-                                    .iter()
-                                    .take(2)
-                                    .map(|p| p.to_string())
-                                    .collect();
-                                label.push_str(" | :");
-                                label.push_str(&shown.join(","));
-                                if ps.detected_ports.len() > shown.len() {
-                                    label.push('+');
-                                }
-                            }
-                        }
-                        if self.app.config.sidebar.show_notification_badge && unread_count > 0 {
-                            label.push_str(" | n:");
-                            label.push_str(&unread_count.to_string());
-                        }
-                        (label, i == active_idx)
-                    })
+                let tabs: Vec<(String, bool)> = (0..tab_count)
+                    .map(|i| (format!("Tab {}", i + 1), i == active_idx))
                     .collect();
                 let tab_bar_bg = RgbColor::new(0x1e, 0x1f, 0x29);
                 let tab_active_bg = theme.colors.background;
@@ -1269,6 +1326,57 @@ impl ApplicationHandler for AppHandler {
                     &tabs, tab_bar_bg, tab_active_bg, tab_fg, tab_active_fg,
                 );
                 let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
+                let sidebar_w = Self::sidebar_width(&self.app.config, state.scale_factor);
+
+                let mut sidebar_lines = Vec::new();
+                let active_ws = state.workspace_mgr.active_workspace();
+                let active_pane = active_ws.active_pane();
+                sidebar_lines.push(format!("Workspace {}", active_ws.id));
+                sidebar_lines.push(String::new());
+                for pane_id in active_ws.pane_ids() {
+                    let marker = if pane_id == active_pane { ">" } else { " " };
+                    sidebar_lines.push(format!("{marker} Pane {}", pane_id));
+                    if let Some(ps) = state.pane_states.get(&pane_id) {
+                        if self.app.config.sidebar.show_cwd {
+                            if let Some(name) = ps.cwd.file_name().and_then(|n| n.to_str()) {
+                                sidebar_lines.push(format!("  cwd: {name}"));
+                            } else if let Some(cwd) = ps.cwd.to_str() {
+                                sidebar_lines.push(format!("  cwd: {cwd}"));
+                            }
+                        }
+                        if self.app.config.sidebar.show_git_branch {
+                            if let Some(branch) = &ps.git_branch {
+                                sidebar_lines.push(format!("  git: {branch}"));
+                            }
+                        }
+                        if self.app.config.sidebar.show_ports && !ps.detected_ports.is_empty() {
+                            let ports: Vec<String> = ps
+                                .detected_ports
+                                .iter()
+                                .take(3)
+                                .map(|p| p.to_string())
+                                .collect();
+                            let mut ports_line = ports.join(", ");
+                            if ps.detected_ports.len() > ports.len() {
+                                ports_line.push_str(", ...");
+                            }
+                            sidebar_lines.push(format!("  ports: {ports_line}"));
+                        }
+                    }
+                    sidebar_lines.push(String::new());
+                }
+                if self.app.config.sidebar.show_notification_badge {
+                    sidebar_lines.push(format!(
+                        "Notifications: {}",
+                        state.notifications.unread_count()
+                    ));
+                }
+                state.renderer.text_renderer.set_sidebar(
+                    sidebar_w,
+                    &sidebar_lines,
+                    RgbColor::new(0x20, 0x21, 0x2b),
+                    theme.colors.foreground,
+                );
 
                 // Update context menu overlay
                 if let Some(ref menu) = state.context_menu {
@@ -1327,7 +1435,7 @@ impl ApplicationHandler for AppHandler {
 
                 let t_grid = Instant::now();
                 for (pane_id, pane_rect) in &layout {
-                    let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale, tab_bar_h);
+                    let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale, tab_bar_h, sidebar_w);
 
                     if let Some(ps) = state.pane_states.get_mut(pane_id) {
                         let show_cursor = *pane_id == active_pane;
@@ -1365,7 +1473,7 @@ impl ApplicationHandler for AppHandler {
                 let grid_dur = t_grid.elapsed();
 
                 // Context menu or tab bar changes also require GPU update
-                if state.context_menu.is_some() || tab_bar_h > 0.0 {
+                if state.context_menu.is_some() || tab_bar_h > 0.0 || sidebar_w > 0.0 {
                     any_updated = true;
                 }
 

@@ -67,6 +67,8 @@ pub struct TextRenderer {
     line_height: f32,
     /// Tab bar label buffer (None = no tab bar)
     tab_bar: Option<TabBar>,
+    /// Left sidebar (None = hidden)
+    sidebar: Option<SidebarPanel>,
     /// Context menu overlay (None = hidden)
     context_menu: Option<ContextMenuOverlay>,
 }
@@ -85,6 +87,16 @@ struct ContextMenuOverlay {
     buffer: Buffer,
     x: f32,
     y: f32,
+    w: f32,
+    h: f32,
+    bg_rects: Vec<crate::bg::BgRect>,
+}
+
+/// Sidebar panel (drawn in main layer)
+struct SidebarPanel {
+    buffer: Buffer,
+    text_x: f32,
+    text_y: f32,
     w: f32,
     h: f32,
     bg_rects: Vec<crate::bg::BgRect>,
@@ -134,6 +146,7 @@ impl TextRenderer {
             font_size: scaled_font_size,
             line_height: scaled_line_height,
             tab_bar: None,
+            sidebar: None,
             context_menu: None,
         }
     }
@@ -337,6 +350,24 @@ impl TextRenderer {
             }
         }
 
+        // Sidebar text
+        if let Some(ref sb) = self.sidebar {
+            text_areas.push(TextArea {
+                buffer: &sb.buffer,
+                left: sb.text_x,
+                top: sb.text_y,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: sb.text_x as i32,
+                    top: sb.text_y as i32,
+                    right: (sb.text_x + sb.w) as i32,
+                    bottom: (sb.text_y + sb.h) as i32,
+                },
+                default_color: default_glyphon_color,
+                custom_glyphs: &[],
+            });
+        }
+
         // Pane text
         for (pane_id, rect) in panes {
             if let Some(pb) = self.pane_buffers.get(pane_id) {
@@ -428,6 +459,10 @@ impl TextRenderer {
         if let Some(ref tb) = self.tab_bar {
             rects.extend_from_slice(&tb.bg_rects);
         }
+        // Sidebar bg rects
+        if let Some(ref sb) = self.sidebar {
+            rects.extend_from_slice(&sb.bg_rects);
+        }
 
         for (pane_id, rect) in panes {
             if let Some(pb) = self.pane_buffers.get(pane_id) {
@@ -480,6 +515,11 @@ impl TextRenderer {
     /// Returns tab bar height in physical pixels (0 if no tab bar)
     pub fn tab_bar_height(&self) -> f32 {
         self.tab_bar.as_ref().map_or(0.0, |tb| tb.height)
+    }
+
+    /// Returns sidebar width in physical pixels (0 if hidden)
+    pub fn sidebar_width(&self) -> f32 {
+        self.sidebar.as_ref().map_or(0.0, |sb| sb.w)
     }
 
     /// Update tab bar content. Pass empty slice to hide.
@@ -594,6 +634,79 @@ impl TextRenderer {
             height: tab_height,
             bg_rects,
             content_hash: hash,
+        });
+    }
+
+    /// Update left sidebar content.
+    pub fn set_sidebar(
+        &mut self,
+        width: f32,
+        lines: &[String],
+        bg: RgbColor,
+        fg: RgbColor,
+    ) {
+        if width <= 0.0 {
+            self.sidebar = None;
+            return;
+        }
+
+        let tab_h = self.tab_bar_height();
+        let panel_h = (self.height as f32 - tab_h).max(1.0);
+        let scale = self.scale_factor;
+        let pad = 8.0 * scale;
+        let border_w = 1.0 * scale;
+
+        let mut bg_rects = Vec::with_capacity(2);
+        bg_rects.push(crate::bg::BgRect {
+            x: 0.0,
+            y: tab_h,
+            w: width,
+            h: panel_h,
+            color: [
+                bg.r as f32 / 255.0,
+                bg.g as f32 / 255.0,
+                bg.b as f32 / 255.0,
+                1.0,
+            ],
+        });
+        bg_rects.push(crate::bg::BgRect {
+            x: (width - border_w).max(0.0),
+            y: tab_h,
+            w: border_w,
+            h: panel_h,
+            color: [0.32, 0.33, 0.38, 1.0],
+        });
+
+        let font_size = self.font_size * 0.78;
+        let line_h = self.line_height * 0.95;
+        let metrics = Metrics::new(font_size, line_h);
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        let text_w = (width - pad * 2.0).max(1.0);
+        let text_h = (panel_h - pad * 2.0).max(1.0);
+        buffer.set_size(&mut self.font_system, Some(text_w), Some(text_h));
+
+        let text = if lines.is_empty() {
+            String::new()
+        } else {
+            lines.join("\n")
+        };
+        let default_attrs = Attrs::new().family(Family::Monospace);
+        let attrs = default_attrs.color(Color::rgb(fg.r, fg.g, fg.b));
+        buffer.set_rich_text(
+            &mut self.font_system,
+            [(&text as &str, attrs)],
+            default_attrs,
+            Shaping::Advanced,
+        );
+        buffer.shape_until_scroll(&mut self.font_system, false);
+
+        self.sidebar = Some(SidebarPanel {
+            buffer,
+            text_x: pad,
+            text_y: tab_h + pad,
+            w: width,
+            h: panel_h,
+            bg_rects,
         });
     }
 
