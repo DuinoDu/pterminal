@@ -25,6 +25,7 @@ wgpu = "23"
 winit = "0.30"
 glyphon = "0.7"
 cosmic-text = "0.12"
+fontdb = "0.16"
 pollster = "0.4"
 
 # Async / IPC

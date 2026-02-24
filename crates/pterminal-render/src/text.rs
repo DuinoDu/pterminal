@@ -77,7 +77,13 @@ impl TextRenderer {
         let scaled_font_size = font_size * scale;
         let scaled_line_height = (font_size * 1.4) * scale;
 
-        let font_system = FontSystem::new();
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        db.set_monospace_family("Menlo");
+        db.set_sans_serif_family("PingFang SC");
+        db.set_serif_family("PingFang SC");
+        // Use zh locale so CJK fallback picks PingFang SC (黑体) not STSong (宋体)
+        let font_system = FontSystem::new_with_locale_and_db("zh-Hans".to_string(), db);
         let swash_cache = SwashCache::new();
         let cache = Cache::new(device);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);

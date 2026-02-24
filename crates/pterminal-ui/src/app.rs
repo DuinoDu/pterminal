@@ -228,6 +228,34 @@ impl AppHandler {
             state.window.set_title(&format!("pterminal [tab {idx}/{count}]"));
         }
     }
+
+    /// Update IME candidate window position to match the terminal cursor
+    fn update_ime_cursor_area(state: &RunningState) {
+        let active = state.workspace_mgr.active_workspace().active_pane();
+        let scale = state.scale_factor as f32;
+        let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
+
+        if let Some(ps) = state.pane_states.get(&active) {
+            let (col, row) = ps.emulator.cursor_position();
+
+            let layout = state.workspace_mgr.active_workspace().split_tree.layout();
+            let pane_rect = layout.iter().find(|(id, _)| *id == active);
+            if let Some((_, rect)) = pane_rect {
+                let w = state.renderer.width();
+                let h = state.renderer.height();
+                let pr = Self::pane_to_pixel_rect(rect, w, h, scale);
+
+                // Position below the cursor line (physical pixels)
+                let cursor_x = pr.x + col as f32 * cell_w;
+                let cursor_y = pr.y + (row as f32 + 1.0) * cell_h;
+
+                state.window.set_ime_cursor_area(
+                    winit::dpi::PhysicalPosition::new(cursor_x as i32, cursor_y as i32),
+                    winit::dpi::PhysicalSize::new(cell_w as u32, cell_h as u32),
+                );
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for AppHandler {
@@ -315,6 +343,8 @@ impl ApplicationHandler for AppHandler {
                 match ime {
                     winit::event::Ime::Enabled => {
                         state.ime_active = true;
+                        // Set initial IME cursor area at current cursor position
+                        Self::update_ime_cursor_area(state);
                     }
                     winit::event::Ime::Disabled => {
                         state.ime_active = false;
@@ -326,8 +356,9 @@ impl ApplicationHandler for AppHandler {
                         }
                         state.window.request_redraw();
                     }
-                    winit::event::Ime::Preedit(..) => {
-                        // TODO: visual preedit feedback
+                    winit::event::Ime::Preedit(_, _) => {
+                        // Update candidate window position during composition
+                        Self::update_ime_cursor_area(state);
                     }
                 }
             }
