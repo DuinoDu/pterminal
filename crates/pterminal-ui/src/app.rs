@@ -8,7 +8,7 @@ use tracing::info;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use pterminal_core::config::theme::{RgbColor, Theme};
@@ -835,31 +835,29 @@ impl ApplicationHandler for AppHandler {
                 // Ctrl+C with selection → copy; Ctrl+V → paste
                 let ctrl = state.modifiers.control_key();
                 if ctrl {
-                    if let Key::Character(ref c) = event.logical_key {
-                        match c.as_str() {
-                            "c" if state.selection.is_some() => {
-                                if let Some(text) =
-                                    Self::get_selected_text(state, &self.app.theme)
-                                {
-                                    if let Some(clip) = &mut state.clipboard {
-                                        let _ = clip.set_text(text);
-                                    }
-                                }
-                                return;
-                            }
-                            "v" => {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyC) if state.selection.is_some() => {
+                            if let Some(text) =
+                                Self::get_selected_text(state, &self.app.theme)
+                            {
                                 if let Some(clip) = &mut state.clipboard {
-                                    if let Ok(text) = clip.get_text() {
-                                        let active = state.workspace_mgr.active_workspace().active_pane();
-                                        if let Some(ps) = state.pane_states.get(&active) {
-                                            let _ = ps.pty.write(text.as_bytes());
-                                        }
+                                    let _ = clip.set_text(text);
+                                }
+                            }
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyV) => {
+                            if let Some(clip) = &mut state.clipboard {
+                                if let Ok(text) = clip.get_text() {
+                                    let active = state.workspace_mgr.active_workspace().active_pane();
+                                    if let Some(ps) = state.pane_states.get(&active) {
+                                        let _ = ps.pty.write(text.as_bytes());
                                     }
                                 }
-                                return;
                             }
-                            _ => {}
+                            return;
                         }
+                        _ => {}
                     }
                 }
 
