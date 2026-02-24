@@ -8,6 +8,7 @@ use tracing::{debug, error};
 /// Handle to a running PTY process
 pub struct PtyHandle {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
     reader_thread: Option<std::thread::JoinHandle<()>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
@@ -67,6 +68,7 @@ impl PtyHandle {
 
         Ok(Self {
             writer,
+            master: pair.master,
             reader_thread: Some(reader_thread),
             _child: child,
         })
@@ -81,10 +83,13 @@ impl PtyHandle {
     }
 
     /// Resize the PTY
-    pub fn resize(&self, _cols: u16, _rows: u16) -> Result<()> {
-        // portable-pty resize is handled through the master.
-        // We'd need to keep a reference to the master for this.
-        // For now, this is a placeholder.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         Ok(())
     }
 }

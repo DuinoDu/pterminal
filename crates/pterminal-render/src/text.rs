@@ -33,9 +33,18 @@ struct LineBuffer {
     content_hash: u64,
 }
 
-/// Per-pane collection of line buffers
+/// Per-pane collection of line buffers + background rects
 struct PaneBuffer {
     lines: Vec<LineBuffer>,
+    /// Background rects in cell-relative coords (col, row, color)
+    bg_cells: Vec<BgCell>,
+}
+
+/// A cell that needs a non-default background
+struct BgCell {
+    col: u16,
+    row: u16,
+    color: [f32; 4],
 }
 
 /// Text rendering using glyphon (cosmic-text + wgpu), supporting multiple panes.
@@ -117,10 +126,12 @@ impl TextRenderer {
         cursor_pos: (u16, u16),
         cursor_visible: bool,
         cursor_color: RgbColor,
+        default_bg: RgbColor,
     ) {
         let metrics = Metrics::new(self.font_size, self.line_height);
         let pb = self.pane_buffers.entry(pane_id).or_insert_with(|| PaneBuffer {
             lines: Vec::new(),
+            bg_cells: Vec::new(),
         });
 
         // Ensure correct number of line buffers
@@ -131,6 +142,25 @@ impl TextRenderer {
             });
         }
         pb.lines.truncate(grid.len());
+
+        // Collect background cells (rebuilt every time content changes)
+        pb.bg_cells.clear();
+        for (row_idx, line) in grid.iter().enumerate() {
+            for (col_idx, cell) in line.cells.iter().enumerate() {
+                if cell.bg != default_bg {
+                    pb.bg_cells.push(BgCell {
+                        col: col_idx as u16,
+                        row: row_idx as u16,
+                        color: [
+                            cell.bg.r as f32 / 255.0,
+                            cell.bg.g as f32 / 255.0,
+                            cell.bg.b as f32 / 255.0,
+                            1.0,
+                        ],
+                    });
+                }
+            }
+        }
 
         let default_attrs = Attrs::new().family(Family::Monospace);
         let (cursor_col, cursor_row) = cursor_pos;
@@ -258,6 +288,27 @@ impl TextRenderer {
 
     pub fn post_render(&mut self) {
         self.atlas.trim();
+    }
+
+    /// Collect background rects for all visible panes (physical pixel coords)
+    pub fn collect_bg_rects(&self, panes: &[(PaneId, PixelRect)]) -> Vec<crate::bg::BgRect> {
+        let cell_w = self.font_size * 0.6;
+        let cell_h = self.line_height;
+        let mut rects = Vec::new();
+        for (pane_id, rect) in panes {
+            if let Some(pb) = self.pane_buffers.get(pane_id) {
+                for bg in &pb.bg_cells {
+                    rects.push(crate::bg::BgRect {
+                        x: rect.x + bg.col as f32 * cell_w,
+                        y: rect.y + bg.row as f32 * cell_h,
+                        w: cell_w,
+                        h: cell_h,
+                        color: bg.color,
+                    });
+                }
+            }
+        }
+        rects
     }
 
     pub fn cell_size(&self) -> (f32, f32) {

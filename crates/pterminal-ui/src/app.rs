@@ -382,6 +382,24 @@ impl ApplicationHandler for AppHandler {
                 }
             }
 
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y as i32 * 3,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        let (_, cell_h) = state.renderer.text_renderer.cell_size();
+                        (pos.y as f32 / cell_h).round() as i32
+                    }
+                };
+                if lines != 0 {
+                    let active = state.workspace_mgr.active_workspace().active_pane();
+                    if let Some(ps) = state.pane_states.get(&active) {
+                        ps.emulator.scroll(lines);
+                        ps.dirty.store(true, Ordering::Relaxed);
+                        state.window.request_redraw();
+                    }
+                }
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
@@ -589,6 +607,7 @@ impl ApplicationHandler for AppHandler {
                                 cursor_pos,
                                 show_cursor,
                                 cursor_color,
+                                theme.colors.background,
                             );
                             ps.last_cursor_visible = show_cursor;
                             ps.dirty.store(false, Ordering::Relaxed);
@@ -603,6 +622,16 @@ impl ApplicationHandler for AppHandler {
                 // Skip GPU work when nothing changed
                 if any_updated {
                     let t_prep = Instant::now();
+
+                    // Prepare background cell colors
+                    let bg_rects = state.renderer.text_renderer.collect_bg_rects(&pane_rects);
+                    state.renderer.bg_renderer.prepare(
+                        &state.renderer.queue,
+                        &bg_rects,
+                        w,
+                        h,
+                    );
+
                     state.renderer.text_renderer.prepare_panes(
                         &state.renderer.device,
                         &state.renderer.queue,

@@ -98,7 +98,20 @@ impl TerminalEmulator {
         (cursor.column.0 as u16, cursor.line.0 as u16)
     }
 
-    /// Extract terminal grid content for rendering
+    /// Scroll the display by delta lines (positive = scroll up into history)
+    pub fn scroll(&self, delta: i32) {
+        use alacritty_terminal::grid::Scroll;
+        let mut inner = self.inner.lock().unwrap();
+        inner.term.grid_mut().scroll_display(Scroll::Delta(delta));
+    }
+
+    /// Get current display offset (0 = bottom, >0 = scrolled into history)
+    pub fn display_offset(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.term.grid().display_offset()
+    }
+
+    /// Extract terminal grid content for rendering (respects display_offset for scrollback)
     pub fn extract_grid(&self, theme: &Theme) -> Vec<GridLine> {
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::cell::Flags;
@@ -107,13 +120,17 @@ impl TerminalEmulator {
         let grid = inner.term.grid();
         let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
+        let display_offset = grid.display_offset();
         let mut lines = Vec::with_capacity(num_lines);
 
         for line_idx in 0..num_lines {
             let mut cells = Vec::with_capacity(num_cols);
+            // display_offset shifts which line we render:
+            // line_idx 0 with offset N → Line(-(N as i32))
+            let actual_line = line_idx as i32 - display_offset as i32;
             for col_idx in 0..num_cols {
                 let point = alacritty_terminal::index::Point::new(
-                    Line(line_idx as i32),
+                    Line(actual_line),
                     Column(col_idx),
                 );
                 let cell = &grid[point];

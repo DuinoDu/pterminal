@@ -1,6 +1,7 @@
 use anyhow::Result;
 use wgpu::SurfaceTarget;
 
+use crate::bg::BgRenderer;
 use crate::text::TextRenderer;
 use pterminal_core::config::theme::RgbColor;
 
@@ -11,6 +12,7 @@ pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub surface_config: wgpu::SurfaceConfiguration,
     pub text_renderer: TextRenderer,
+    pub bg_renderer: BgRenderer,
 }
 
 impl Renderer {
@@ -77,12 +79,15 @@ impl Renderer {
             &device, &queue, surface_format, width, height, scale_factor, font_size,
         );
 
+        let bg_renderer = BgRenderer::new(&device, surface_format, width, height);
+
         Ok(Self {
             device,
             queue,
             surface,
             surface_config,
             text_renderer,
+            bg_renderer,
         })
     }
 
@@ -148,6 +153,8 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
+            // Background colors first, then text on top
+            self.bg_renderer.render(&mut pass);
             self.text_renderer.render(&mut pass);
         }
 
