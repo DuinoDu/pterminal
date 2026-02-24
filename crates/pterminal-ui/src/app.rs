@@ -239,6 +239,7 @@ impl ApplicationHandler for AppHandler {
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 640.0));
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        window.set_ime_allowed(true);
 
         let scale_factor = window.scale_factor();
         let size = window.inner_size();
@@ -304,6 +305,20 @@ impl ApplicationHandler for AppHandler {
 
             WindowEvent::ModifiersChanged(mods) => {
                 state.modifiers = mods.state();
+            }
+
+            // IME composition (Chinese, Japanese, Korean input, dead keys)
+            WindowEvent::Ime(ime) => {
+                match ime {
+                    winit::event::Ime::Commit(text) => {
+                        let active = state.workspace_mgr.active_workspace().active_pane();
+                        if let Some(ps) = state.pane_states.get(&active) {
+                            let _ = ps.pty.write(text.as_bytes());
+                        }
+                        state.window.request_redraw();
+                    }
+                    _ => {} // Preedit / Enabled / Disabled — ignore for now
+                }
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -694,37 +709,38 @@ impl ApplicationHandler for AppHandler {
 
 /// Convert winit key events to bytes for PTY input
 fn key_to_bytes(event: &winit::event::KeyEvent) -> Option<Vec<u8>> {
-    match &event.logical_key {
-        Key::Named(named) => {
-            let bytes: &[u8] = match named {
-                NamedKey::Enter => b"\r",
-                NamedKey::Backspace => b"\x7f",
-                NamedKey::Tab => b"\t",
-                NamedKey::Escape => b"\x1b",
-                NamedKey::ArrowUp => b"\x1b[A",
-                NamedKey::ArrowDown => b"\x1b[B",
-                NamedKey::ArrowRight => b"\x1b[C",
-                NamedKey::ArrowLeft => b"\x1b[D",
-                NamedKey::Home => b"\x1b[H",
-                NamedKey::End => b"\x1b[F",
-                NamedKey::PageUp => b"\x1b[5~",
-                NamedKey::PageDown => b"\x1b[6~",
-                NamedKey::Delete => b"\x1b[3~",
-                NamedKey::Insert => b"\x1b[2~",
-                NamedKey::Space => b" ",
-                _ => return None,
-            };
-            Some(bytes.to_vec())
-        }
-        Key::Character(_) => {
-            if let Some(text) = &event.text {
-                let s = text.as_str();
-                if !s.is_empty() {
-                    return Some(s.as_bytes().to_vec());
-                }
-            }
-            None
-        }
-        _ => None,
+    // Named keys (arrows, enter, etc.) first
+    if let Key::Named(named) = &event.logical_key {
+        let bytes: &[u8] = match named {
+            NamedKey::Enter => b"\r",
+            NamedKey::Backspace => b"\x7f",
+            NamedKey::Tab => b"\t",
+            NamedKey::Escape => b"\x1b",
+            NamedKey::ArrowUp => b"\x1b[A",
+            NamedKey::ArrowDown => b"\x1b[B",
+            NamedKey::ArrowRight => b"\x1b[C",
+            NamedKey::ArrowLeft => b"\x1b[D",
+            NamedKey::Home => b"\x1b[H",
+            NamedKey::End => b"\x1b[F",
+            NamedKey::PageUp => b"\x1b[5~",
+            NamedKey::PageDown => b"\x1b[6~",
+            NamedKey::Delete => b"\x1b[3~",
+            NamedKey::Insert => b"\x1b[2~",
+            NamedKey::Space => b" ",
+            _ => return None,
+        };
+        return Some(bytes.to_vec());
     }
+
+    // For all other keys (Character, etc.), use event.text which
+    // accounts for keyboard layout, modifiers (Shift, Option/Alt),
+    // dead keys, and IME composition. This handles: . ~ ! @ # $ etc.
+    if let Some(text) = &event.text {
+        let s = text.as_str();
+        if !s.is_empty() {
+            return Some(s.as_bytes().to_vec());
+        }
+    }
+
+    None
 }
