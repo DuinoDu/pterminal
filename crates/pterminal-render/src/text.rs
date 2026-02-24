@@ -10,19 +10,13 @@ use pterminal_core::config::theme::RgbColor;
 use pterminal_core::split::PaneId;
 use pterminal_core::terminal::GridLine;
 
-/// A colored span of text for rich-text rendering (using byte ranges into shared buffer)
+/// A colored span referencing byte ranges in a shared String
 struct RichSpan {
     start: usize,
     end: usize,
     fg: RgbColor,
     bold: bool,
     italic: bool,
-}
-
-/// Flat buffer + spans approach: one String allocation, spans reference ranges
-struct SpanBuffer {
-    text: String,
-    spans: Vec<RichSpan>,
 }
 
 /// Pixel rectangle for pane positioning (physical pixels)
@@ -33,12 +27,19 @@ pub struct PixelRect {
     pub h: f32,
 }
 
-struct PaneBuffer {
+/// Per-line render buffer with change detection
+struct LineBuffer {
     buffer: Buffer,
     content_hash: u64,
 }
 
-/// Text rendering using glyphon (cosmic-text + wgpu), supporting multiple panes
+/// Per-pane collection of line buffers
+struct PaneBuffer {
+    lines: Vec<LineBuffer>,
+}
+
+/// Text rendering using glyphon (cosmic-text + wgpu), supporting multiple panes.
+/// Uses per-line Buffers so only changed lines are reshaped.
 pub struct TextRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -93,7 +94,6 @@ impl TextRenderer {
     pub fn resize(&mut self, _queue: &wgpu::Queue, width: u32, height: u32) {
         self.width = width;
         self.height = height;
-        // Pane buffers are resized lazily via set_pane_content / prepare_panes
     }
 
     pub fn update_scale_factor(&mut self, scale_factor: f64, font_size: f32) {
@@ -103,11 +103,13 @@ impl TextRenderer {
         self.line_height = (font_size * 1.4) * scale;
         let metrics = Metrics::new(self.font_size, self.line_height);
         for pb in self.pane_buffers.values_mut() {
-            pb.buffer.set_metrics(&mut self.font_system, metrics);
+            for lb in &mut pb.lines {
+                lb.buffer.set_metrics(&mut self.font_system, metrics);
+            }
         }
     }
 
-    /// Update a specific pane's buffer content.
+    /// Update a pane's line buffers. Only reshapes lines whose content changed.
     pub fn set_pane_content(
         &mut self,
         pane_id: PaneId,
@@ -116,60 +118,71 @@ impl TextRenderer {
         cursor_visible: bool,
         cursor_color: RgbColor,
     ) {
-        let span_buf = build_span_buffer(grid, cursor_pos, cursor_visible, cursor_color);
-        let hash = hash_span_buffer(&span_buf);
-
-        // Create buffer on first access
-        let pb = self.pane_buffers.entry(pane_id).or_insert_with(|| {
-            let buffer = Buffer::new(
-                &mut self.font_system,
-                Metrics::new(self.font_size, self.line_height),
-            );
-            PaneBuffer {
-                buffer,
-                content_hash: 0,
-            }
+        let metrics = Metrics::new(self.font_size, self.line_height);
+        let pb = self.pane_buffers.entry(pane_id).or_insert_with(|| PaneBuffer {
+            lines: Vec::new(),
         });
 
-        if hash == pb.content_hash {
-            return;
+        // Ensure correct number of line buffers
+        while pb.lines.len() < grid.len() {
+            pb.lines.push(LineBuffer {
+                buffer: Buffer::new(&mut self.font_system, metrics),
+                content_hash: 0,
+            });
         }
-        pb.content_hash = hash;
+        pb.lines.truncate(grid.len());
 
         let default_attrs = Attrs::new().family(Family::Monospace);
-        let rich: Vec<(&str, Attrs)> = span_buf.spans
-            .iter()
-            .map(|span| {
-                let text_slice = &span_buf.text[span.start..span.end];
-                let mut attrs = default_attrs
-                    .color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
-                if span.bold {
-                    attrs = attrs.weight(Weight::BOLD);
-                }
-                if span.italic {
-                    attrs = attrs.style(Style::Italic);
-                }
-                (text_slice, attrs)
-            })
-            .collect();
+        let (cursor_col, cursor_row) = cursor_pos;
 
-        pb.buffer.set_rich_text(
-            &mut self.font_system,
-            rich,
-            default_attrs,
-            Shaping::Basic,
-        );
-        pb.buffer
-            .shape_until_scroll(&mut self.font_system, false);
+        for (row_idx, line) in grid.iter().enumerate() {
+            let line_cursor = if cursor_visible && row_idx == cursor_row as usize {
+                Some(cursor_col)
+            } else {
+                None
+            };
+
+            let hash = hash_line(line, line_cursor, cursor_color);
+            if hash == pb.lines[row_idx].content_hash {
+                continue;
+            }
+            pb.lines[row_idx].content_hash = hash;
+
+            let (text, spans) = build_line_rich_text(line, line_cursor, cursor_color);
+            let rich: Vec<(&str, Attrs)> = spans
+                .iter()
+                .map(|span| {
+                    let slice = &text[span.start..span.end];
+                    let mut attrs =
+                        default_attrs.color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
+                    if span.bold {
+                        attrs = attrs.weight(Weight::BOLD);
+                    }
+                    if span.italic {
+                        attrs = attrs.style(Style::Italic);
+                    }
+                    (slice, attrs)
+                })
+                .collect();
+
+            pb.lines[row_idx].buffer.set_rich_text(
+                &mut self.font_system,
+                rich,
+                default_attrs,
+                Shaping::Basic,
+            );
+            pb.lines[row_idx]
+                .buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
     }
 
-    /// Remove a pane's buffer (when the pane is closed).
+    /// Remove a pane's buffers (when the pane is closed).
     pub fn remove_pane(&mut self, pane_id: PaneId) {
         self.pane_buffers.remove(&pane_id);
     }
 
-    /// Prepare all visible panes for rendering. Each entry maps a PaneId to its
-    /// physical pixel rectangle on screen.
+    /// Prepare all visible panes for rendering.
     pub fn prepare_panes(
         &mut self,
         device: &wgpu::Device,
@@ -183,38 +196,47 @@ impl TextRenderer {
         };
         self.viewport.update(queue, resolution);
 
-        // Resize each pane buffer to match its pixel rect
+        // Set width on each line buffer
         for (pane_id, rect) in panes {
             if let Some(pb) = self.pane_buffers.get_mut(pane_id) {
-                pb.buffer.set_size(
-                    &mut self.font_system,
-                    Some(rect.w),
-                    Some(rect.h),
-                );
+                for lb in &mut pb.lines {
+                    lb.buffer.set_size(
+                        &mut self.font_system,
+                        Some(rect.w),
+                        Some(self.line_height),
+                    );
+                }
             }
         }
 
         let default_glyphon_color = Color::rgb(default_color.r, default_color.g, default_color.b);
+        let line_h = self.line_height;
 
         let text_areas: Vec<TextArea<'_>> = panes
             .iter()
             .filter_map(|(pane_id, rect)| {
                 let pb = self.pane_buffers.get(pane_id)?;
-                Some(TextArea {
-                    buffer: &pb.buffer,
-                    left: rect.x,
-                    top: rect.y,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: rect.x as i32,
-                        top: rect.y as i32,
-                        right: (rect.x + rect.w) as i32,
-                        bottom: (rect.y + rect.h) as i32,
-                    },
-                    default_color: default_glyphon_color,
-                    custom_glyphs: &[],
-                })
+                Some(
+                    pb.lines
+                        .iter()
+                        .enumerate()
+                        .map(move |(idx, lb)| TextArea {
+                            buffer: &lb.buffer,
+                            left: rect.x,
+                            top: rect.y + idx as f32 * line_h,
+                            scale: 1.0,
+                            bounds: TextBounds {
+                                left: rect.x as i32,
+                                top: rect.y as i32,
+                                right: (rect.x + rect.w) as i32,
+                                bottom: (rect.y + rect.h) as i32,
+                            },
+                            default_color: default_glyphon_color,
+                            custom_glyphs: &[],
+                        }),
+                )
             })
+            .flatten()
             .collect();
 
         let _ = self.glyphon_renderer.prepare(
@@ -228,19 +250,16 @@ impl TextRenderer {
         );
     }
 
-    /// Prepare and render text
     pub fn render<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
         let _ = self
             .glyphon_renderer
             .render(&self.atlas, &self.viewport, pass);
     }
 
-    /// Post-render cleanup: trim atlas
     pub fn post_render(&mut self) {
         self.atlas.trim();
     }
 
-    /// Cell dimensions in physical pixels
     pub fn cell_size(&self) -> (f32, f32) {
         (self.font_size * 0.6, self.line_height)
     }
@@ -250,66 +269,76 @@ impl TextRenderer {
     }
 }
 
-/// Build rich text spans from grid using a flat text buffer (zero per-span allocation).
-fn build_span_buffer(
-    grid: &[GridLine],
-    cursor_pos: (u16, u16),
-    cursor_visible: bool,
-    cursor_color: RgbColor,
-) -> SpanBuffer {
-    let (cursor_col, cursor_row) = cursor_pos;
-    let estimated_chars = grid.len() * (if grid.is_empty() { 80 } else { grid[0].cells.len() + 1 });
-    let mut text = String::with_capacity(estimated_chars);
-    let mut spans: Vec<RichSpan> = Vec::with_capacity(grid.len() * 4);
+/// Hash a single terminal line including cursor state
+fn hash_line(line: &GridLine, cursor_col: Option<u16>, cursor_color: RgbColor) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (col, cell) in line.cells.iter().enumerate() {
+        let is_cursor = cursor_col.map_or(false, |c| c as usize == col);
+        if is_cursor {
+            0xFFu8.hash(&mut hasher);
+            cursor_color.r.hash(&mut hasher);
+            cursor_color.g.hash(&mut hasher);
+            cursor_color.b.hash(&mut hasher);
+        } else {
+            cell.c.hash(&mut hasher);
+            cell.fg.r.hash(&mut hasher);
+            cell.fg.g.hash(&mut hasher);
+            cell.fg.b.hash(&mut hasher);
+            cell.bold.hash(&mut hasher);
+            cell.italic.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
 
-    // Current span tracking
+/// Build rich text spans for a single terminal line
+fn build_line_rich_text(
+    line: &GridLine,
+    cursor_col: Option<u16>,
+    cursor_color: RgbColor,
+) -> (String, Vec<RichSpan>) {
+    let mut text = String::with_capacity(line.cells.len());
+    let mut spans: Vec<RichSpan> = Vec::with_capacity(8);
+
     let mut cur_fg = RgbColor::new(255, 255, 255);
     let mut cur_bold = false;
     let mut cur_italic = false;
     let mut span_start = 0;
 
-    for (row_idx, line) in grid.iter().enumerate() {
-        if row_idx > 0 {
-            text.push('\n');
-        }
+    for (col, cell) in line.cells.iter().enumerate() {
+        let is_cursor = cursor_col.map_or(false, |c| c as usize == col);
+        let ch = if is_cursor {
+            '█'
+        } else if cell.c == '\0' {
+            ' '
+        } else {
+            cell.c
+        };
+        let fg = if is_cursor { cursor_color } else { cell.fg };
+        let bold = if is_cursor { false } else { cell.bold };
+        let italic = if is_cursor { false } else { cell.italic };
 
-        for (col_idx, cell) in line.cells.iter().enumerate() {
-            let is_cursor =
-                cursor_visible && row_idx == cursor_row as usize && col_idx == cursor_col as usize;
-            let ch = if is_cursor {
-                '█'
-            } else {
-                let c = cell.c;
-                if c == '\0' { ' ' } else { c }
-            };
-            let fg = if is_cursor { cursor_color } else { cell.fg };
-            let bold = if is_cursor { false } else { cell.bold };
-            let italic = if is_cursor { false } else { cell.italic };
-
-            // Check if attributes changed
-            if fg != cur_fg || bold != cur_bold || italic != cur_italic {
-                // Close current span if it has content
-                let cur_pos = text.len();
-                if cur_pos > span_start {
-                    spans.push(RichSpan {
-                        start: span_start,
-                        end: cur_pos,
-                        fg: cur_fg,
-                        bold: cur_bold,
-                        italic: cur_italic,
-                    });
-                }
-                span_start = cur_pos;
-                cur_fg = fg;
-                cur_bold = bold;
-                cur_italic = italic;
+        if fg != cur_fg || bold != cur_bold || italic != cur_italic {
+            let cur_pos = text.len();
+            if cur_pos > span_start {
+                spans.push(RichSpan {
+                    start: span_start,
+                    end: cur_pos,
+                    fg: cur_fg,
+                    bold: cur_bold,
+                    italic: cur_italic,
+                });
             }
-
-            text.push(ch);
+            span_start = cur_pos;
+            cur_fg = fg;
+            cur_bold = bold;
+            cur_italic = italic;
         }
+
+        text.push(ch);
     }
 
-    // Close final span
     if text.len() > span_start {
         spans.push(RichSpan {
             start: span_start,
@@ -320,20 +349,5 @@ fn build_span_buffer(
         });
     }
 
-    SpanBuffer { text, spans }
-}
-
-/// Fast hash of the flat span buffer
-fn hash_span_buffer(buf: &SpanBuffer) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    buf.text.hash(&mut hasher);
-    for span in &buf.spans {
-        span.start.hash(&mut hasher);
-        span.fg.r.hash(&mut hasher);
-        span.fg.g.hash(&mut hasher);
-        span.fg.b.hash(&mut hasher);
-        span.bold.hash(&mut hasher);
-    }
-    hasher.finish()
+    (text, spans)
 }

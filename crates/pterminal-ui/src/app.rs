@@ -67,6 +67,10 @@ struct RunningState {
     selection: Option<Selection>,
     mouse_pressed: bool,
     last_mouse_pos: (f64, f64), // logical pixels
+    // Performance monitoring
+    frame_count: u64,
+    fps_timer: Instant,
+    debug_timing: bool,
 }
 
 impl App {
@@ -260,6 +264,7 @@ impl ApplicationHandler for AppHandler {
         pane_states.insert(initial_pane_id, ps);
 
         let clipboard = Clipboard::new().ok();
+        let debug_timing = std::env::var("PTERMINAL_DEBUG").is_ok();
         info!(cols, rows, scale_factor, "Terminal started");
 
         let running = RunningState {
@@ -273,6 +278,9 @@ impl ApplicationHandler for AppHandler {
             selection: None,
             mouse_pressed: false,
             last_mouse_pos: (0.0, 0.0),
+            frame_count: 0,
+            fps_timer: Instant::now(),
+            debug_timing,
         };
 
         Self::update_title(&running);
@@ -533,6 +541,7 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::RedrawRequested => {
+                let t_frame = Instant::now();
                 let theme = &self.app.theme;
                 let scale = state.scale_factor as f32;
                 let w = state.renderer.width();
@@ -543,7 +552,9 @@ impl ApplicationHandler for AppHandler {
 
                 let mut pane_rects: Vec<(PaneId, PixelRect)> = Vec::with_capacity(layout.len());
                 let cursor_color = theme.colors.cursor;
+                let mut any_updated = false;
 
+                let t_grid = Instant::now();
                 for (pane_id, pane_rect) in &layout {
                     let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale);
 
@@ -565,22 +576,53 @@ impl ApplicationHandler for AppHandler {
                             );
                             ps.last_cursor_visible = show_cursor;
                             ps.dirty.store(false, Ordering::Relaxed);
+                            any_updated = true;
                         }
                     }
 
                     pane_rects.push((*pane_id, px_rect));
                 }
+                let grid_dur = t_grid.elapsed();
 
-                state.renderer.text_renderer.prepare_panes(
-                    &state.renderer.device,
-                    &state.renderer.queue,
-                    &pane_rects,
-                    theme.colors.foreground,
-                );
+                // Skip GPU work when nothing changed
+                if any_updated {
+                    let t_prep = Instant::now();
+                    state.renderer.text_renderer.prepare_panes(
+                        &state.renderer.device,
+                        &state.renderer.queue,
+                        &pane_rects,
+                        theme.colors.foreground,
+                    );
+                    let prep_dur = t_prep.elapsed();
 
-                let _ = state
-                    .renderer
-                    .render_frame(theme.colors.background, |_| {});
+                    let t_render = Instant::now();
+                    let _ = state
+                        .renderer
+                        .render_frame(theme.colors.background, |_| {});
+                    let render_dur = t_render.elapsed();
+
+                    if state.debug_timing {
+                        let total = t_frame.elapsed();
+                        eprintln!(
+                            "[frame] total={:?} grid={:?} prepare={:?} render={:?}",
+                            total, grid_dur, prep_dur, render_dur,
+                        );
+                    }
+                }
+
+                // FPS counter in title
+                state.frame_count += 1;
+                let fps_elapsed = state.fps_timer.elapsed();
+                if fps_elapsed >= Duration::from_secs(1) {
+                    let fps = state.frame_count as f32 / fps_elapsed.as_secs_f32();
+                    state.frame_count = 0;
+                    state.fps_timer = Instant::now();
+                    let idx = state.workspace_mgr.active_index() + 1;
+                    let count = state.workspace_mgr.workspace_count();
+                    state.window.set_title(&format!(
+                        "pterminal [tab {idx}/{count}] {fps:.0} fps"
+                    ));
+                }
             }
 
             _ => {}
