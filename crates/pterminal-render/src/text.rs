@@ -558,10 +558,10 @@ impl TextRenderer {
     ) {
         let scale = self.scale_factor;
         let item_h = 30.0 * scale;
-        let menu_w = 140.0 * scale;
-        let menu_h = items.len() as f32 * item_h + 4.0 * scale; // 2px padding top+bottom
+        let menu_w = 160.0 * scale;
+        let menu_h = items.len() as f32 * item_h + 4.0 * scale;
         let pad = 6.0 * scale;
-        let font_size = self.font_size * 0.8;
+        let font_size = self.font_size * 0.85;
         let border = 1.0 * scale;
 
         // Clamp to screen
@@ -569,25 +569,43 @@ impl TextRenderer {
         let my = y.min(self.height as f32 - menu_h - pad);
 
         let mut bg_rects = Vec::new();
-        // Border (light gray outline)
+        // Shadow (offset slightly)
+        bg_rects.push(crate::bg::BgRect {
+            x: mx + 2.0 * scale,
+            y: my + 2.0 * scale,
+            w: menu_w + border * 2.0,
+            h: menu_h + border * 2.0,
+            color: [0.0, 0.0, 0.0, 0.5],
+        });
+        // Border
         bg_rects.push(crate::bg::BgRect {
             x: mx - border,
             y: my - border,
             w: menu_w + border * 2.0,
             h: menu_h + border * 2.0,
-            color: [0.45, 0.45, 0.50, 1.0], // gray border
+            color: [0.55, 0.55, 0.58, 1.0],
         });
-        // Background (solid dark)
+        // Solid opaque background — intentionally bright enough to stand out
         bg_rects.push(crate::bg::BgRect {
             x: mx,
             y: my,
             w: menu_w,
             h: menu_h,
-            color: [0.20, 0.20, 0.24, 1.0], // #333
+            color: [0.22, 0.22, 0.26, 1.0],
         });
+        // Per-item background strips for visual separation
+        let y_pad = 2.0 * scale;
+        for i in 0..items.len() {
+            bg_rects.push(crate::bg::BgRect {
+                x: mx + 2.0 * scale,
+                y: my + y_pad + i as f32 * item_h,
+                w: menu_w - 4.0 * scale,
+                h: item_h,
+                color: [0.28, 0.28, 0.32, 1.0],
+            });
+        }
 
         // Text buffer
-        let y_offset = 2.0 * scale;
         let metrics = Metrics::new(font_size, item_h);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, Some(menu_w), Some(menu_h));
@@ -604,7 +622,7 @@ impl TextRenderer {
         }
 
         let default_attrs = Attrs::new().family(Family::Monospace);
-        let fg_color = Color::rgb(0xff, 0xff, 0xff);
+        let fg_color = Color::rgb(0xee, 0xee, 0xee);
         let rich: Vec<(&str, Attrs)> = spans
             .iter()
             .map(|(s, e)| (&text[*s..*e], default_attrs.color(fg_color)))
@@ -615,7 +633,7 @@ impl TextRenderer {
         self.context_menu = Some(ContextMenuOverlay {
             buffer,
             x: mx,
-            y: my + y_offset,
+            y: my + y_pad,
             w: menu_w,
             h: menu_h,
             bg_rects,

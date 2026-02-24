@@ -66,7 +66,11 @@ struct RunningState {
     // Mouse selection
     selection: Option<Selection>,
     mouse_pressed: bool,
-    last_mouse_pos: (f64, f64), // logical pixels
+    last_mouse_pos: (f64, f64), // physical pixels
+    // Click counting for double/triple click
+    last_click_time: Instant,
+    last_click_pos: (u16, u16),
+    click_count: u8,
     // IME state — when true, character input comes via Ime::Commit
     ime_active: bool,
     // Context menu state
@@ -165,6 +169,50 @@ impl AppHandler {
             }
         }
         if text.is_empty() { None } else { Some(text) }
+    }
+
+    /// Find the word boundaries around a cell position
+    fn word_selection_at(state: &RunningState, theme: &Theme, col: u16, row: u16) -> Selection {
+        let active_pane = state.workspace_mgr.active_workspace().active_pane();
+        if let Some(ps) = state.pane_states.get(&active_pane) {
+            let grid = ps.emulator.extract_grid(theme);
+            if (row as usize) < grid.len() {
+                let line = &grid[row as usize];
+                let cells = &line.cells;
+                let c = col as usize;
+                if c < cells.len() {
+                    let is_word_char = |ch: char| ch.is_alphanumeric() || ch == '_';
+                    let ch = cells[c].c;
+                    if is_word_char(ch) {
+                        let mut start = c;
+                        while start > 0 && is_word_char(cells[start - 1].c) {
+                            start -= 1;
+                        }
+                        let mut end = c;
+                        while end + 1 < cells.len() && is_word_char(cells[end + 1].c) {
+                            end += 1;
+                        }
+                        return Selection {
+                            start: (start as u16, row),
+                            end: (end as u16, row),
+                        };
+                    }
+                }
+            }
+        }
+        Selection { start: (col, row), end: (col, row) }
+    }
+
+    /// Select the entire line at the given row
+    fn line_selection_at(state: &RunningState, row: u16) -> Selection {
+        let active_pane = state.workspace_mgr.active_workspace().active_pane();
+        let max_col = if let Some(ps) = state.pane_states.get(&active_pane) {
+            let (cols, _) = ps.emulator.size();
+            cols.saturating_sub(1)
+        } else {
+            79
+        };
+        Selection { start: (0, row), end: (max_col, row) }
     }
 
     /// Spawn a new terminal pane and store its state
@@ -284,7 +332,7 @@ impl AppHandler {
         scale: f32,
     ) -> Option<ContextMenuItem> {
         let item_h = 30.0 * scale;
-        let menu_w = 140.0 * scale;
+        let menu_w = 160.0 * scale;
         let menu_x = menu.x;
         let menu_y = menu.y;
 
@@ -352,6 +400,9 @@ impl ApplicationHandler for AppHandler {
             selection: None,
             mouse_pressed: false,
             last_mouse_pos: (0.0, 0.0),
+            last_click_time: Instant::now() - Duration::from_secs(10),
+            last_click_pos: (0, 0),
+            click_count: 0,
             ime_active: false,
             context_menu: None,
             frame_count: 0,
@@ -519,7 +570,33 @@ impl ApplicationHandler for AppHandler {
                     ElementState::Pressed => {
                         state.mouse_pressed = true;
                         let cell = Self::pixel_to_cell(state);
-                        state.selection = Some(Selection { start: cell, end: cell });
+                        let now = Instant::now();
+                        let double_click_threshold = Duration::from_millis(400);
+                        // Count rapid clicks at same position
+                        if now.duration_since(state.last_click_time) < double_click_threshold
+                            && state.last_click_pos == cell
+                        {
+                            state.click_count = (state.click_count % 3) + 1;
+                        } else {
+                            state.click_count = 1;
+                        }
+                        state.last_click_time = now;
+                        state.last_click_pos = cell;
+
+                        match state.click_count {
+                            2 => {
+                                // Double-click: select word
+                                state.selection = Some(Self::word_selection_at(state, &self.app.theme, cell.0, cell.1));
+                            }
+                            3 => {
+                                // Triple-click: select entire line
+                                state.selection = Some(Self::line_selection_at(state, cell.1));
+                            }
+                            _ => {
+                                // Single click: start new selection
+                                state.selection = Some(Selection { start: cell, end: cell });
+                            }
+                        }
                         let active = state.workspace_mgr.active_workspace().active_pane();
                         if let Some(ps) = state.pane_states.get(&active) {
                             ps.dirty.store(true, Ordering::Relaxed);
@@ -527,12 +604,15 @@ impl ApplicationHandler for AppHandler {
                     }
                     ElementState::Released => {
                         state.mouse_pressed = false;
-                        if let Some(sel) = &state.selection {
-                            if sel.start == sel.end {
-                                state.selection = None;
-                                let active = state.workspace_mgr.active_workspace().active_pane();
-                                if let Some(ps) = state.pane_states.get(&active) {
-                                    ps.dirty.store(true, Ordering::Relaxed);
+                        // Only clear selection for single-click with no drag
+                        if state.click_count <= 1 {
+                            if let Some(sel) = &state.selection {
+                                if sel.start == sel.end {
+                                    state.selection = None;
+                                    let active = state.workspace_mgr.active_workspace().active_pane();
+                                    if let Some(ps) = state.pane_states.get(&active) {
+                                        ps.dirty.store(true, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
