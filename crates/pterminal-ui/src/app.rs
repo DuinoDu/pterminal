@@ -642,7 +642,8 @@ impl ApplicationHandler for AppHandler {
 
             WindowEvent::CursorMoved { position, .. } => {
                 state.last_mouse_pos = (position.x, position.y);
-                if state.mouse_pressed {
+                // Only drag-extend for single-click selections (not word/line)
+                if state.mouse_pressed && state.click_count <= 1 {
                     let cell = Self::pixel_to_cell(state);
                     if let Some(sel) = &mut state.selection {
                         if sel.end != cell {

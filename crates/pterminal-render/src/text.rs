@@ -613,10 +613,10 @@ impl TextRenderer {
         let mut text = String::new();
         let mut spans = Vec::new();
         for (i, (label, _enabled)) in items.iter().enumerate() {
+            let start = text.len();
             if i > 0 {
                 text.push('\n');
             }
-            let start = text.len();
             text.push_str(&format!("  {}", label));
             spans.push((start, text.len()));
         }
