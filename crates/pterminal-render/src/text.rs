@@ -56,6 +56,8 @@ pub struct TextRenderer {
     swash_cache: SwashCache,
     atlas: TextAtlas,
     glyphon_renderer: GlyphonTextRenderer,
+    /// Separate renderer for overlay text (context menu) — renders after overlay bg
+    overlay_renderer: GlyphonTextRenderer,
     viewport: Viewport,
     pane_buffers: HashMap<PaneId, PaneBuffer>,
     width: u32,
@@ -113,6 +115,8 @@ impl TextRenderer {
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
         let glyphon_renderer =
             GlyphonTextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+        let overlay_renderer =
+            GlyphonTextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         let viewport = Viewport::new(device, &cache);
 
         Self {
@@ -120,6 +124,7 @@ impl TextRenderer {
             swash_cache,
             atlas,
             glyphon_renderer,
+            overlay_renderer,
             viewport,
             pane_buffers: HashMap::new(),
             width,
@@ -351,9 +356,22 @@ impl TextRenderer {
             }
         }
 
-        // Context menu text (rendered on top)
+        // Pane + tab bar text (NOT context menu — that's in overlay pass)
+        let _ = self.glyphon_renderer.prepare(
+            device,
+            queue,
+            &mut self.font_system,
+            &mut self.atlas,
+            &self.viewport,
+            text_areas,
+            &mut self.swash_cache,
+        );
+
+        // Context menu text — separate prepare for overlay rendering
+        let mut overlay_areas: Vec<TextArea<'_>> = Vec::new();
         if let Some(ref cm) = self.context_menu {
-            text_areas.push(TextArea {
+            let default_glyphon_color2 = Color::rgb(default_color.r, default_color.g, default_color.b);
+            overlay_areas.push(TextArea {
                 buffer: &cm.buffer,
                 left: cm.x,
                 top: cm.y,
@@ -364,18 +382,17 @@ impl TextRenderer {
                     right: (cm.x + cm.w) as i32,
                     bottom: (cm.y + cm.h) as i32,
                 },
-                default_color: default_glyphon_color,
+                default_color: default_glyphon_color2,
                 custom_glyphs: &[],
             });
         }
-
-        let _ = self.glyphon_renderer.prepare(
+        let _ = self.overlay_renderer.prepare(
             device,
             queue,
             &mut self.font_system,
             &mut self.atlas,
             &self.viewport,
-            text_areas,
+            overlay_areas,
             &mut self.swash_cache,
         );
     }
@@ -383,6 +400,13 @@ impl TextRenderer {
     pub fn render<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
         let _ = self
             .glyphon_renderer
+            .render(&self.atlas, &self.viewport, pass);
+    }
+
+    /// Render overlay text (context menu) — call after overlay bg
+    pub fn render_overlay<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        let _ = self
+            .overlay_renderer
             .render(&self.atlas, &self.viewport, pass);
     }
 
@@ -426,12 +450,16 @@ impl TextRenderer {
             }
         }
 
-        // Context menu bg rects (on top of everything)
-        if let Some(ref cm) = self.context_menu {
-            rects.extend_from_slice(&cm.bg_rects);
-        }
-
         rects
+    }
+
+    /// Collect overlay bg rects (context menu) — drawn AFTER text
+    pub fn collect_overlay_bg_rects(&self) -> Vec<crate::bg::BgRect> {
+        if let Some(ref cm) = self.context_menu {
+            cm.bg_rects.clone()
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn cell_size(&self) -> (f32, f32) {

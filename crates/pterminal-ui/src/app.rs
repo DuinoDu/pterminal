@@ -71,6 +71,8 @@ struct RunningState {
     last_click_time: Instant,
     last_click_pos: (u16, u16),
     click_count: u8,
+    /// Suppress the next left-button release (after context menu click)
+    skip_next_release: bool,
     // IME state — when true, character input comes via Ime::Commit
     ime_active: bool,
     // Context menu state
@@ -403,6 +405,7 @@ impl ApplicationHandler for AppHandler {
             last_click_time: Instant::now() - Duration::from_secs(10),
             last_click_pos: (0, 0),
             click_count: 0,
+            skip_next_release: false,
             ime_active: false,
             context_menu: None,
             frame_count: 0,
@@ -523,6 +526,7 @@ impl ApplicationHandler for AppHandler {
                             }
                         }
                         state.context_menu = None;
+                        state.skip_next_release = true;
                         state.window.request_redraw();
                         return;
                     }
@@ -604,6 +608,10 @@ impl ApplicationHandler for AppHandler {
                     }
                     ElementState::Released => {
                         state.mouse_pressed = false;
+                        if state.skip_next_release {
+                            state.skip_next_release = false;
+                            return;
+                        }
                         // Only clear selection for single-click with no drag
                         if state.click_count <= 1 {
                             if let Some(sel) = &state.selection {
@@ -943,6 +951,15 @@ impl ApplicationHandler for AppHandler {
                     state.renderer.bg_renderer.prepare(
                         &state.renderer.queue,
                         &bg_rects,
+                        w,
+                        h,
+                    );
+
+                    // Prepare overlay (context menu) bg — rendered after text
+                    let overlay_rects = state.renderer.text_renderer.collect_overlay_bg_rects();
+                    state.renderer.overlay_bg_renderer.prepare(
+                        &state.renderer.queue,
+                        &overlay_rects,
                         w,
                         h,
                     );

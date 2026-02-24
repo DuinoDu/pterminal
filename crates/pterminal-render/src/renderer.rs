@@ -13,6 +13,8 @@ pub struct Renderer {
     pub surface_config: wgpu::SurfaceConfiguration,
     pub text_renderer: TextRenderer,
     pub bg_renderer: BgRenderer,
+    /// Overlay bg renderer — draws AFTER text (for context menu)
+    pub overlay_bg_renderer: BgRenderer,
 }
 
 impl Renderer {
@@ -84,6 +86,7 @@ impl Renderer {
         );
 
         let bg_renderer = BgRenderer::new(&device, surface_format, width, height);
+        let overlay_bg_renderer = BgRenderer::new(&device, surface_format, width, height);
 
         Ok(Self {
             device,
@@ -92,6 +95,7 @@ impl Renderer {
             surface_config,
             text_renderer,
             bg_renderer,
+            overlay_bg_renderer,
         })
     }
 
@@ -157,9 +161,11 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            // Background colors first, then text on top
+            // Background colors first, then text, then overlay (menu bg + menu text) on top
             self.bg_renderer.render(&mut pass);
             self.text_renderer.render(&mut pass);
+            self.overlay_bg_renderer.render(&mut pass);
+            self.text_renderer.render_overlay(&mut pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
