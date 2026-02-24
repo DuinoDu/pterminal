@@ -29,7 +29,7 @@ fontdb = "0.16"
 pollster = "0.4"
 
 # Async / IPC
-tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros", "time"] }
 
 # Serialization / Config
 serde = { version = "1", features = ["derive"] }

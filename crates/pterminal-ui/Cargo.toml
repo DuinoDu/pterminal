@@ -6,9 +6,11 @@ edition.workspace = true
 [dependencies]
 pterminal-core.workspace = true
 pterminal-render.workspace = true
+pterminal-ipc.workspace = true
 winit.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 arboard.workspace = true
+serde_json.workspace = true

@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arboard::Clipboard;
-use tracing::info;
+use serde_json::{Value, json};
+use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -15,7 +18,8 @@ use pterminal_core::config::theme::{RgbColor, Theme};
 use pterminal_core::split::{PaneId, SplitDirection};
 use pterminal_core::terminal::{PtyHandle, TerminalEmulator};
 use pterminal_core::workspace::WorkspaceManager;
-use pterminal_core::Config;
+use pterminal_core::{Config, NotificationStore, git_info, port_scanner};
+use pterminal_ipc::{IpcServer, JsonRpcRequest, JsonRpcResponse};
 use pterminal_render::Renderer;
 use pterminal_render::text::PixelRect;
 
@@ -46,6 +50,9 @@ struct PaneState {
     dirty: Arc<AtomicBool>,
     /// Last cursor visible state used in rendering (for blink-only updates)
     last_cursor_visible: bool,
+    cwd: PathBuf,
+    git_branch: Option<String>,
+    detected_ports: Vec<u16>,
 }
 
 /// Main application state
@@ -81,6 +88,10 @@ struct RunningState {
     frame_count: u64,
     fps_timer: Instant,
     debug_timing: bool,
+    notifications: NotificationStore,
+    ipc_rx: Receiver<IpcEnvelope>,
+    _ipc_server: Option<IpcServer>,
+    ipc_socket_path: PathBuf,
 }
 
 /// Right-click context menu
@@ -94,6 +105,11 @@ struct ContextMenu {
 enum ContextMenuItem {
     Copy,
     Paste,
+}
+
+struct IpcEnvelope {
+    request: JsonRpcRequest,
+    response_tx: Sender<JsonRpcResponse>,
 }
 
 impl App {
@@ -179,6 +195,40 @@ impl AppHandler {
         if text.is_empty() { None } else { Some(text) }
     }
 
+    fn grid_to_text(grid: &[pterminal_core::terminal::GridLine]) -> String {
+        let mut out = String::new();
+        for (row_idx, line) in grid.iter().enumerate() {
+            let mut row = String::with_capacity(line.cells.len());
+            for cell in &line.cells {
+                let c = if cell.c == '\0' { ' ' } else { cell.c };
+                row.push(c);
+            }
+            while row.ends_with(' ') {
+                row.pop();
+            }
+            out.push_str(&row);
+            if row_idx + 1 < grid.len() {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    fn update_pane_metadata(config: &Config, pane: &mut PaneState, grid: &[pterminal_core::terminal::GridLine]) {
+        if config.sidebar.show_git_branch && pane.git_branch.is_none() {
+            pane.git_branch = git_info::current_branch(&pane.cwd);
+        }
+        if config.sidebar.show_ports {
+            let text = Self::grid_to_text(grid);
+            let ports = port_scanner::detect_ports_in_text(&text);
+            if ports != pane.detected_ports {
+                pane.detected_ports = ports;
+            }
+        } else if !pane.detected_ports.is_empty() {
+            pane.detected_ports.clear();
+        }
+    }
+
     /// Find the word boundaries around a cell position
     fn word_selection_at(state: &RunningState, theme: &Theme, col: u16, row: u16) -> Selection {
         let active_pane = state.workspace_mgr.active_workspace().active_pane();
@@ -233,6 +283,11 @@ impl AppHandler {
     ) -> PaneState {
         let shell = config.shell();
         let cwd = config.working_directory();
+        let git_branch = if config.sidebar.show_git_branch {
+            git_info::current_branch(&cwd)
+        } else {
+            None
+        };
         let dirty = Arc::new(AtomicBool::new(true));
 
         let emulator = TerminalEmulator::new(cols, rows);
@@ -254,7 +309,15 @@ impl AppHandler {
 
         info!(pane_id, cols, rows, %shell, "Pane spawned");
 
-        PaneState { emulator, pty, dirty, last_cursor_visible: true }
+        PaneState {
+            emulator,
+            pty,
+            dirty,
+            last_cursor_visible: true,
+            cwd,
+            git_branch,
+            detected_ports: Vec::new(),
+        }
     }
 
     /// Calculate cols/rows from a physical-pixel pane rect
@@ -360,6 +423,223 @@ impl AppHandler {
         }
         None
     }
+
+    fn handle_ipc_requests(
+        state: &mut RunningState,
+        config: &Config,
+        theme: &Theme,
+        event_loop: &ActiveEventLoop,
+    ) {
+        while let Ok(msg) = state.ipc_rx.try_recv() {
+            let response = Self::handle_ipc_request(state, config, theme, event_loop, msg.request);
+            let _ = msg.response_tx.send(response);
+        }
+    }
+
+    fn handle_ipc_request(
+        state: &mut RunningState,
+        config: &Config,
+        theme: &Theme,
+        event_loop: &ActiveEventLoop,
+        request: JsonRpcRequest,
+    ) -> JsonRpcResponse {
+        if request.jsonrpc != "2.0" {
+            return JsonRpcResponse::invalid_request(request.id);
+        }
+
+        let id = request.id.clone();
+        let params = &request.params;
+
+        match request.method.as_str() {
+            "ping" | "system.ping" => JsonRpcResponse::success(id, json!({ "pong": true })),
+            "capabilities" | "system.capabilities" => JsonRpcResponse::success(
+                id,
+                json!({
+                    "methods": [
+                        "ping", "capabilities", "identify",
+                        "workspace.list", "workspace.new", "workspace.close", "workspace.select",
+                        "pane.list", "terminal.send", "pane.read_screen", "pane.capture",
+                        "notification.send", "notification.list", "notification.clear",
+                        "window.list", "window.current", "window.close"
+                    ]
+                }),
+            ),
+            "identify" | "system.identify" => JsonRpcResponse::success(
+                id,
+                json!({
+                    "app": "pterminal",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "pid": std::process::id(),
+                    "platform": std::env::consts::OS,
+                    "socket": state.ipc_socket_path.to_string_lossy(),
+                }),
+            ),
+            "window.list" | "list-windows" => JsonRpcResponse::success(
+                id,
+                json!({
+                    "windows": [{
+                        "id": 0u64,
+                        "title": "pterminal",
+                        "active": true
+                    }]
+                }),
+            ),
+            "window.current" => JsonRpcResponse::success(id, json!({ "id": 0u64 })),
+            "window.close" | "close-window" => {
+                event_loop.exit();
+                JsonRpcResponse::success(id, json!({ "closed": true }))
+            }
+            "workspace.list" | "list-workspaces" => {
+                let active_idx = state.workspace_mgr.active_index();
+                let workspaces: Vec<Value> = state
+                    .workspace_mgr
+                    .workspaces()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, ws)| {
+                        json!({
+                            "id": ws.id,
+                            "index": idx,
+                            "name": ws.name,
+                            "active": idx == active_idx,
+                            "pane_count": ws.pane_ids().len()
+                        })
+                    })
+                    .collect();
+                JsonRpcResponse::success(id, json!({ "workspaces": workspaces }))
+            }
+            "workspace.new" | "new-workspace" => {
+                let (ws_id, pane_id) = state.workspace_mgr.add_workspace();
+                let (cols, rows) = Self::rect_to_cols_rows(&state.renderer, state.scale_factor);
+                let ps = Self::spawn_pane(config, pane_id, cols, rows, &state.window);
+                state.pane_states.insert(pane_id, ps);
+                Self::update_title(state);
+                state.window.request_redraw();
+                JsonRpcResponse::success(id, json!({ "workspace_id": ws_id, "pane_id": pane_id }))
+            }
+            "workspace.close" | "close-workspace" => {
+                let target_ws = params
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| state.workspace_mgr.active_workspace().id);
+                if state.workspace_mgr.workspace_count() <= 1 {
+                    return JsonRpcResponse::invalid_params(id, "cannot close last workspace");
+                }
+                let Some((ws_id, pane_ids)) = state
+                    .workspace_mgr
+                    .workspaces()
+                    .iter()
+                    .find(|ws| ws.id == target_ws)
+                    .map(|ws| (ws.id, ws.pane_ids()))
+                else {
+                    return JsonRpcResponse::invalid_params(id, "workspace not found");
+                };
+                for pid in &pane_ids {
+                    state.pane_states.remove(pid);
+                    state.renderer.text_renderer.remove_pane(*pid);
+                }
+                state.workspace_mgr.close_workspace(ws_id);
+                Self::update_title(state);
+                state.window.request_redraw();
+                JsonRpcResponse::success(id, json!({ "closed_workspace_id": ws_id }))
+            }
+            "workspace.select" | "select-workspace" => {
+                let index = if let Some(ws_id) = params.get("id").and_then(Value::as_u64) {
+                    state
+                        .workspace_mgr
+                        .workspaces()
+                        .iter()
+                        .position(|ws| ws.id == ws_id)
+                } else {
+                    params.get("index").and_then(Value::as_u64).map(|v| v as usize)
+                };
+                let Some(index) = index else {
+                    return JsonRpcResponse::invalid_params(id, "workspace id or index required");
+                };
+                if index >= state.workspace_mgr.workspace_count() {
+                    return JsonRpcResponse::invalid_params(id, "workspace index out of range");
+                }
+                state.workspace_mgr.select_workspace(index);
+                Self::update_title(state);
+                state.window.request_redraw();
+                JsonRpcResponse::success(
+                    id,
+                    json!({
+                        "selected_index": index,
+                        "workspace_id": state.workspace_mgr.active_workspace().id
+                    }),
+                )
+            }
+            "pane.list" | "list-panes" => {
+                let panes: Vec<Value> = state
+                    .workspace_mgr
+                    .active_workspace()
+                    .pane_ids()
+                    .into_iter()
+                    .map(|pane_id| {
+                        json!({
+                            "id": pane_id,
+                            "active": pane_id == state.workspace_mgr.active_workspace().active_pane(),
+                            "alive": state.pane_states.get(&pane_id).is_some_and(|ps| ps.pty.is_alive())
+                        })
+                    })
+                    .collect();
+                JsonRpcResponse::success(id, json!({ "panes": panes }))
+            }
+            "terminal.send" | "send" => {
+                let Some(text) = params.get("text").and_then(Value::as_str) else {
+                    return JsonRpcResponse::invalid_params(id, "missing params.text");
+                };
+                let pane_id = params
+                    .get("pane_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| state.workspace_mgr.active_workspace().active_pane());
+                let Some(ps) = state.pane_states.get(&pane_id) else {
+                    return JsonRpcResponse::invalid_params(id, "pane not found");
+                };
+                if let Err(e) = ps.pty.write(text.as_bytes()) {
+                    return JsonRpcResponse::internal_error(id, format!("pty write failed: {e}"));
+                }
+                state.window.request_redraw();
+                JsonRpcResponse::success(id, json!({ "pane_id": pane_id, "bytes": text.len() }))
+            }
+            "pane.read_screen" | "read-screen" | "pane.capture" | "capture-pane" => {
+                let pane_id = params
+                    .get("pane_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| state.workspace_mgr.active_workspace().active_pane());
+                let Some(ps) = state.pane_states.get(&pane_id) else {
+                    return JsonRpcResponse::invalid_params(id, "pane not found");
+                };
+                let grid = ps.emulator.extract_grid(theme);
+                let text = Self::grid_to_text(&grid);
+                JsonRpcResponse::success(id, json!({ "pane_id": pane_id, "text": text }))
+            }
+            "notification.send" | "notify" => {
+                let title = params
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Notification");
+                let body = params
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .or_else(|| params.get("message").and_then(Value::as_str))
+                    .unwrap_or("");
+                let item = state.notifications.push(title, body);
+                state.window.request_redraw();
+                JsonRpcResponse::success(id, json!({ "notification": item }))
+            }
+            "notification.list" | "list-notifications" => {
+                JsonRpcResponse::success(id, json!({ "notifications": state.notifications.list() }))
+            }
+            "notification.clear" | "clear-notifications" => {
+                state.notifications.clear();
+                state.window.request_redraw();
+                JsonRpcResponse::success(id, json!({ "cleared": true }))
+            }
+            _ => JsonRpcResponse::method_not_found(id, &request.method),
+        }
+    }
 }
 
 impl ApplicationHandler for AppHandler {
@@ -400,6 +680,28 @@ impl ApplicationHandler for AppHandler {
 
         let clipboard = Clipboard::new().ok();
         let debug_timing = std::env::var("PTERMINAL_DEBUG").is_ok();
+        let (ipc_tx, ipc_rx) = mpsc::channel::<IpcEnvelope>();
+        let ipc_socket_path = Config::config_dir().join("pterminal.sock");
+        let ipc_server = match IpcServer::start(
+            &ipc_socket_path,
+            Arc::new(move |request: JsonRpcRequest| {
+                let req_id = request.id.clone();
+                let (resp_tx, resp_rx) = mpsc::channel();
+                if ipc_tx.send(IpcEnvelope { request, response_tx: resp_tx }).is_err() {
+                    return JsonRpcResponse::internal_error(req_id, "application unavailable");
+                }
+                match resp_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(resp) => resp,
+                    Err(_) => JsonRpcResponse::internal_error(req_id, "request timed out"),
+                }
+            }),
+        ) {
+            Ok(server) => Some(server),
+            Err(e) => {
+                warn!("failed to start IPC server: {e}");
+                None
+            }
+        };
         info!(cols, rows, scale_factor, "Terminal started");
 
         let running = RunningState {
@@ -422,6 +724,10 @@ impl ApplicationHandler for AppHandler {
             frame_count: 0,
             fps_timer: Instant::now(),
             debug_timing,
+            notifications: NotificationStore::new(),
+            ipc_rx,
+            _ipc_server: ipc_server,
+            ipc_socket_path,
         };
 
         Self::update_title(&running);
@@ -437,6 +743,8 @@ impl ApplicationHandler for AppHandler {
         let Some(state) = &mut self.app.state else {
             return;
         };
+
+        Self::handle_ipc_requests(state, &self.app.config, &self.app.theme, event_loop);
 
         match event {
             WindowEvent::CloseRequested => {
@@ -907,10 +1215,51 @@ impl ApplicationHandler for AppHandler {
                 let h = state.renderer.height();
 
                 // Update tab bar
-                let tab_count = state.workspace_mgr.workspace_count();
                 let active_idx = state.workspace_mgr.active_index();
-                let tabs: Vec<(String, bool)> = (0..tab_count)
-                    .map(|i| (format!("Tab {}", i + 1), i == active_idx))
+                let unread_count = state.notifications.unread_count();
+                let tabs: Vec<(String, bool)> = state
+                    .workspace_mgr
+                    .workspaces()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ws)| {
+                        let mut label = format!("Tab {}", i + 1);
+                        if let Some(ps) = state.pane_states.get(&ws.active_pane()) {
+                            if self.app.config.sidebar.show_cwd {
+                                if let Some(cwd_name) = ps.cwd.file_name().and_then(|n| n.to_str()) {
+                                    label.push_str(" | ");
+                                    label.push_str(cwd_name);
+                                } else if let Some(cwd) = ps.cwd.to_str() {
+                                    label.push_str(" | ");
+                                    label.push_str(cwd);
+                                }
+                            }
+                            if self.app.config.sidebar.show_git_branch {
+                                if let Some(branch) = &ps.git_branch {
+                                    label.push_str(" | git:");
+                                    label.push_str(branch);
+                                }
+                            }
+                            if self.app.config.sidebar.show_ports && !ps.detected_ports.is_empty() {
+                                let shown: Vec<String> = ps
+                                    .detected_ports
+                                    .iter()
+                                    .take(2)
+                                    .map(|p| p.to_string())
+                                    .collect();
+                                label.push_str(" | :");
+                                label.push_str(&shown.join(","));
+                                if ps.detected_ports.len() > shown.len() {
+                                    label.push('+');
+                                }
+                            }
+                        }
+                        if self.app.config.sidebar.show_notification_badge && unread_count > 0 {
+                            label.push_str(" | n:");
+                            label.push_str(&unread_count.to_string());
+                        }
+                        (label, i == active_idx)
+                    })
                     .collect();
                 let tab_bar_bg = RgbColor::new(0x1e, 0x1f, 0x29);
                 let tab_active_bg = theme.colors.background;
@@ -987,6 +1336,7 @@ impl ApplicationHandler for AppHandler {
 
                         if content_dirty || cursor_changed || state.selection.is_some() {
                             let grid = ps.emulator.extract_grid(theme);
+                            Self::update_pane_metadata(&self.app.config, ps, &grid);
                             let cursor_pos = ps.emulator.cursor_position();
                             let sel = if *pane_id == active_pane {
                                 state.selection.map(|s| s.normalized())
@@ -1084,7 +1434,8 @@ impl ApplicationHandler for AppHandler {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.app.state {
+        if let Some(state) = &mut self.app.state {
+            Self::handle_ipc_requests(state, &self.app.config, &self.app.theme, event_loop);
             let active_panes = state.workspace_mgr.active_workspace().pane_ids();
             let any_dirty = active_panes.iter().any(|pid| {
                 state.pane_states.get(pid).map_or(false, |ps| ps.dirty.load(Ordering::Relaxed))
