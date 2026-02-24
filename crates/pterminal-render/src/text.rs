@@ -573,13 +573,15 @@ impl TextRenderer {
             label_buf.shape_until_scroll(&mut self.font_system, false);
             tab_buffers.push((label_buf, x_offset));
 
-            // Close button ✕ (right side of tab)
-            let mut close_buf = Buffer::new(&mut self.font_system, metrics);
+            // Close button ✕ (right side of tab, larger font)
+            let close_font_size = tab_font_size * 1.3;
+            let close_metrics = Metrics::new(close_font_size, tab_height);
+            let mut close_buf = Buffer::new(&mut self.font_system, close_metrics);
             close_buf.set_size(&mut self.font_system, Some(close_btn_w), Some(tab_height));
             let dim_color = default_attrs.color(Color::rgb(fg.r, fg.g, fg.b));
             close_buf.set_rich_text(
                 &mut self.font_system,
-                [("✕", dim_color)],
+                [(" ✕", dim_color)],
                 default_attrs,
                 Shaping::Advanced,
             );
