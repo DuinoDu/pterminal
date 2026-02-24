@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tracing::info;
@@ -26,7 +27,7 @@ struct RunningState {
     renderer: Renderer,
     emulator: TerminalEmulator,
     pty: PtyHandle,
-    needs_redraw: bool,
+    dirty: Arc<AtomicBool>,
 }
 
 impl App {
@@ -40,7 +41,6 @@ impl App {
 
     pub fn run(self) -> Result<()> {
         let event_loop = EventLoop::new()?;
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
 
         let mut handler = AppHandler {
             app: self,
@@ -90,11 +90,15 @@ impl ApplicationHandler for AppHandler {
         let shell = self.app.config.shell();
         let cwd = self.app.config.working_directory();
 
+        let dirty = Arc::new(AtomicBool::new(true));
+
         let emulator_handle = emulator.clone_inner();
         let window_for_redraw = window.clone();
+        let dirty_for_pty = Arc::clone(&dirty);
 
         let pty = PtyHandle::spawn(&shell, &cwd, cols, rows, move |data| {
             emulator_handle.process(data);
+            dirty_for_pty.store(true, Ordering::Relaxed);
             window_for_redraw.request_redraw();
         })
         .expect("spawn PTY");
@@ -106,7 +110,7 @@ impl ApplicationHandler for AppHandler {
             renderer,
             emulator,
             pty,
-            needs_redraw: true,
+            dirty,
         });
     }
 
@@ -136,13 +140,17 @@ impl ApplicationHandler for AppHandler {
 
                 state.emulator.resize(cols, rows);
                 let _ = state.pty.resize(cols, rows);
-                state.needs_redraw = true;
+                state.dirty.store(true, Ordering::Relaxed);
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    if let Some(text) = key_to_bytes(&event) {
-                        let _ = state.pty.write(text.as_bytes());
+                if event.state == ElementState::Pressed || event.state == ElementState::Released {
+                    // Only handle press (and repeat, which winit sends as Pressed)
+                    if event.state == ElementState::Pressed {
+                        if let Some(bytes) = key_to_bytes(&event) {
+                            let _ = state.pty.write(&bytes);
+                            state.window.request_redraw();
+                        }
                     }
                 }
             }
@@ -161,46 +169,84 @@ impl ApplicationHandler for AppHandler {
                 let _ = state.renderer.render_frame(theme.colors.background, |_text| {
                     // Text already prepared above
                 });
-                state.needs_redraw = false;
+                state.dirty.store(false, Ordering::Relaxed);
             }
 
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.app.state {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(state) = &mut self.app.state {
             // Poll terminal events
             let events = state.emulator.poll_events();
-            if !events.is_empty() || state.needs_redraw {
+            if !events.is_empty() {
+                state.dirty.store(true, Ordering::Relaxed);
+            }
+
+            if state.dirty.load(Ordering::Relaxed) {
                 state.window.request_redraw();
             }
+
+            // Wake up periodically to check for PTY output (16ms ≈ 60fps)
+            event_loop.set_control_flow(
+                winit::event_loop::ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(16),
+                ),
+            );
         }
     }
 }
 
 /// Convert winit key events to bytes for PTY input
-fn key_to_bytes(event: &winit::event::KeyEvent) -> Option<String> {
+fn key_to_bytes(event: &winit::event::KeyEvent) -> Option<Vec<u8>> {
+    
+
+    // Check if Ctrl is held (for Ctrl+C, Ctrl+D, etc.)
+    // winit puts the text with modifiers applied in event.text
+    // but Ctrl+key combos need special handling
+
     match &event.logical_key {
-        Key::Character(c) => Some(c.to_string()),
-        Key::Named(named) => match named {
-            NamedKey::Enter => Some("\r".to_string()),
-            NamedKey::Backspace => Some("\x7f".to_string()),
-            NamedKey::Tab => Some("\t".to_string()),
-            NamedKey::Escape => Some("\x1b".to_string()),
-            NamedKey::ArrowUp => Some("\x1b[A".to_string()),
-            NamedKey::ArrowDown => Some("\x1b[B".to_string()),
-            NamedKey::ArrowRight => Some("\x1b[C".to_string()),
-            NamedKey::ArrowLeft => Some("\x1b[D".to_string()),
-            NamedKey::Home => Some("\x1b[H".to_string()),
-            NamedKey::End => Some("\x1b[F".to_string()),
-            NamedKey::PageUp => Some("\x1b[5~".to_string()),
-            NamedKey::PageDown => Some("\x1b[6~".to_string()),
-            NamedKey::Delete => Some("\x1b[3~".to_string()),
-            NamedKey::Insert => Some("\x1b[2~".to_string()),
-            NamedKey::Space => Some(" ".to_string()),
-            _ => None,
-        },
+        Key::Named(named) => {
+            let bytes: &[u8] = match named {
+                NamedKey::Enter => b"\r",
+                NamedKey::Backspace => b"\x7f",
+                NamedKey::Tab => b"\t",
+                NamedKey::Escape => b"\x1b",
+                NamedKey::ArrowUp => b"\x1b[A",
+                NamedKey::ArrowDown => b"\x1b[B",
+                NamedKey::ArrowRight => b"\x1b[C",
+                NamedKey::ArrowLeft => b"\x1b[D",
+                NamedKey::Home => b"\x1b[H",
+                NamedKey::End => b"\x1b[F",
+                NamedKey::PageUp => b"\x1b[5~",
+                NamedKey::PageDown => b"\x1b[6~",
+                NamedKey::Delete => b"\x1b[3~",
+                NamedKey::Insert => b"\x1b[2~",
+                NamedKey::Space => b" ",
+                _ => return None,
+            };
+            Some(bytes.to_vec())
+        }
+        Key::Character(c) => {
+            // Use event.text for the actual input (respects modifiers like Shift)
+            if let Some(text) = &event.text {
+                let s = text.as_str();
+                if !s.is_empty() {
+                    return Some(s.as_bytes().to_vec());
+                }
+            }
+            // Fallback: handle Ctrl+key by checking if the character is a-z
+            // and the text field is empty (macOS may not provide text for Ctrl combos)
+            let ch = c.as_str().chars().next()?;
+            if ch.is_ascii_lowercase() {
+                // Could be Ctrl+key — but we can't tell without modifier state here.
+                // Just pass the character through as-is.
+                Some(c.as_str().as_bytes().to_vec())
+            } else {
+                Some(c.as_str().as_bytes().to_vec())
+            }
+        }
         _ => None,
     }
 }
