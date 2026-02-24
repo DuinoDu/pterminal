@@ -59,7 +59,10 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        let present_mode = if surface_caps
+            .present_modes
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
             wgpu::PresentMode::Mailbox // lowest latency, no vsync stall
         } else {
             wgpu::PresentMode::AutoNoVsync
@@ -71,7 +74,10 @@ impl Renderer {
             width,
             height,
             present_mode,
-            alpha_mode: if surface_caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            alpha_mode: if surface_caps
+                .alpha_modes
+                .contains(&wgpu::CompositeAlphaMode::Opaque)
+            {
                 wgpu::CompositeAlphaMode::Opaque
             } else {
                 surface_caps.alpha_modes[0]
@@ -82,7 +88,13 @@ impl Renderer {
         surface.configure(&device, &surface_config);
 
         let text_renderer = TextRenderer::new(
-            &device, &queue, surface_format, width, height, scale_factor, font_size,
+            &device,
+            &queue,
+            surface_format,
+            width,
+            height,
+            scale_factor,
+            font_size,
         );
 
         let bg_renderer = BgRenderer::new(&device, surface_format, width, height);

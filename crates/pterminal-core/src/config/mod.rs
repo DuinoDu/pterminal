@@ -112,9 +112,7 @@ impl Config {
     pub fn config_dir() -> PathBuf {
         ProjectDirs::from("", "", "pterminal")
             .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or_else(|| {
-                dirs_fallback().join("pterminal")
-            })
+            .unwrap_or_else(|| dirs_fallback().join("pterminal"))
     }
 
     pub fn config_path() -> PathBuf {

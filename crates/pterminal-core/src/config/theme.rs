@@ -64,11 +64,11 @@ impl Default for ThemeColors {
     fn default() -> Self {
         // iTerm2 default dark theme (Snazzy variant)
         Self {
-            background: RgbColor::new(0x27, 0x29, 0x35),  // #272935
-            foreground: RgbColor::new(0xef, 0xf0, 0xea),  // #eff0ea
-            cursor: RgbColor::new(0xe9, 0xe9, 0xe9),      // #e9e9e9
-            selection_bg: RgbColor::new(0x92, 0xbb, 0xd0),  // #92bbd0
-            selection_fg: RgbColor::new(0x00, 0x00, 0x00),  // #000000
+            background: RgbColor::new(0x27, 0x29, 0x35),   // #272935
+            foreground: RgbColor::new(0xef, 0xf0, 0xea),   // #eff0ea
+            cursor: RgbColor::new(0xe9, 0xe9, 0xe9),       // #e9e9e9
+            selection_bg: RgbColor::new(0x92, 0xbb, 0xd0), // #92bbd0
+            selection_fg: RgbColor::new(0x00, 0x00, 0x00), // #000000
             ansi: [
                 // Normal colors (0-7)
                 RgbColor::new(0x00, 0x00, 0x00), // 0 black    #000000

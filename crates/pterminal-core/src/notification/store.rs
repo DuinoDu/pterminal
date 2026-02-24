@@ -62,4 +62,3 @@ fn now_ms() -> u128 {
         .map(|d| d.as_millis())
         .unwrap_or(0)
 }
-

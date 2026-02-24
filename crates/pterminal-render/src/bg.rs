@@ -27,7 +27,12 @@ pub struct BgRenderer {
 }
 
 impl BgRenderer {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bg_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("bg.wgsl").into()),
@@ -165,10 +170,22 @@ impl BgRenderer {
         for (i, rect) in rects.iter().take(count).enumerate() {
             let base = (i * 4) as u32;
             let (x0, y0, x1, y1) = (rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
-            vertices.push(BgVertex { position: [x0, y0], color: rect.color });
-            vertices.push(BgVertex { position: [x1, y0], color: rect.color });
-            vertices.push(BgVertex { position: [x1, y1], color: rect.color });
-            vertices.push(BgVertex { position: [x0, y1], color: rect.color });
+            vertices.push(BgVertex {
+                position: [x0, y0],
+                color: rect.color,
+            });
+            vertices.push(BgVertex {
+                position: [x1, y0],
+                color: rect.color,
+            });
+            vertices.push(BgVertex {
+                position: [x1, y1],
+                color: rect.color,
+            });
+            vertices.push(BgVertex {
+                position: [x0, y1],
+                color: rect.color,
+            });
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
 

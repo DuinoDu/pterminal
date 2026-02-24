@@ -59,7 +59,10 @@ impl IpcServer {
                         let listener = match UnixListener::bind(&path_for_thread) {
                             Ok(listener) => listener,
                             Err(e) => {
-                                error!("failed to bind IPC socket {}: {e}", path_for_thread.display());
+                                error!(
+                                    "failed to bind IPC socket {}: {e}",
+                                    path_for_thread.display()
+                                );
                                 return;
                             }
                         };
@@ -81,7 +84,11 @@ impl IpcServer {
 }
 
 #[cfg(unix)]
-async fn run_accept_loop(listener: UnixListener, handler: RpcHandler, mut shutdown_rx: oneshot::Receiver<()>) {
+async fn run_accept_loop(
+    listener: UnixListener,
+    handler: RpcHandler,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => {
@@ -146,7 +153,9 @@ async fn handle_client(stream: UnixStream, handler: RpcHandler) {
                 break;
             }
         };
-        if writer_half.write_all(&payload).await.is_err() || writer_half.write_all(b"\n").await.is_err() {
+        if writer_half.write_all(&payload).await.is_err()
+            || writer_half.write_all(b"\n").await.is_err()
+        {
             break;
         }
     }

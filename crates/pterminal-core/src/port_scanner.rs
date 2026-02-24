@@ -40,4 +40,3 @@ pub fn detect_ports_in_text(text: &str) -> Vec<u16> {
 
     ports.into_iter().collect()
 }
-

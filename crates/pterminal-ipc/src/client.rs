@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -43,7 +43,9 @@ impl IpcClient {
         {
             let _ = method;
             let _ = params;
-            return Err(anyhow!("IPC client is only implemented for unix in this build"));
+            return Err(anyhow!(
+                "IPC client is only implemented for unix in this build"
+            ));
         }
 
         #[cfg(unix)]
@@ -54,7 +56,9 @@ impl IpcClient {
             let mut stream = timeout(self.timeout, UnixStream::connect(&self.socket_path))
                 .await
                 .context("IPC connect timeout")?
-                .with_context(|| format!("failed to connect to socket {}", self.socket_path.display()))?;
+                .with_context(|| {
+                    format!("failed to connect to socket {}", self.socket_path.display())
+                })?;
 
             let payload = serde_json::to_vec(&request)?;
             timeout(self.timeout, stream.write_all(&payload))
@@ -73,8 +77,8 @@ impl IpcClient {
                 return Err(anyhow!("IPC connection closed by server"));
             }
 
-            let response: JsonRpcResponse = serde_json::from_str(line.trim())
-                .context("failed to parse IPC response")?;
+            let response: JsonRpcResponse =
+                serde_json::from_str(line.trim()).context("failed to parse IPC response")?;
             if let Some(err) = response.error {
                 return Err(anyhow!("RPC error {}: {}", err.code, err.message));
             }

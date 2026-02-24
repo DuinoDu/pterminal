@@ -45,4 +45,3 @@ fn read_head_ref(git_dir: &Path) -> Option<String> {
         None
     }
 }
-

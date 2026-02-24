@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arboard::Clipboard;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -18,10 +21,10 @@ use pterminal_core::config::theme::{RgbColor, Theme};
 use pterminal_core::split::{PaneId, SplitDirection};
 use pterminal_core::terminal::{PtyHandle, TerminalEmulator};
 use pterminal_core::workspace::WorkspaceManager;
-use pterminal_core::{Config, NotificationStore, git_info, port_scanner};
+use pterminal_core::{git_info, port_scanner, Config, NotificationStore};
 use pterminal_ipc::{IpcServer, JsonRpcRequest, JsonRpcResponse};
-use pterminal_render::Renderer;
 use pterminal_render::text::PixelRect;
+use pterminal_render::Renderer;
 
 /// Text selection range in grid coordinates
 #[derive(Clone, Copy, PartialEq)]
@@ -33,9 +36,7 @@ struct Selection {
 impl Selection {
     /// Normalize so start <= end (row-major order)
     fn normalized(&self) -> ((u16, u16), (u16, u16)) {
-        if self.start.1 < self.end.1
-            || (self.start.1 == self.end.1 && self.start.0 <= self.end.0)
-        {
+        if self.start.1 < self.end.1 || (self.start.1 == self.end.1 && self.start.0 <= self.end.0) {
             (self.start, self.end)
         } else {
             (self.end, self.start)
@@ -53,6 +54,17 @@ struct PaneState {
     cwd: PathBuf,
     git_branch: Option<String>,
     detected_ports: Vec<u16>,
+}
+
+struct SessionMeta {
+    id: u64,
+    name: String,
+}
+
+struct SessionSnapshot {
+    workspace_mgr: WorkspaceManager,
+    pane_states: HashMap<PaneId, PaneState>,
+    notifications: NotificationStore,
 }
 
 /// Main application state
@@ -89,14 +101,22 @@ struct RunningState {
     fps_timer: Instant,
     debug_timing: bool,
     notifications: NotificationStore,
+    sessions: Vec<SessionMeta>,
+    active_session_idx: usize,
+    next_session_id: u64,
+    parked_sessions: HashMap<u64, SessionSnapshot>,
     ipc_rx: Receiver<IpcEnvelope>,
     _ipc_server: Option<IpcServer>,
     ipc_socket_path: PathBuf,
+    sidebar_visible: bool,
+    sidebar_panel_width: f32,
+    sidebar_resizing: bool,
+    split_drag: Option<SplitDrag>,
 }
 
 /// Right-click context menu
 struct ContextMenu {
-    x: f32,         // physical pixels
+    x: f32, // physical pixels
     y: f32,
     items: Vec<ContextMenuItem>,
 }
@@ -110,6 +130,11 @@ enum ContextMenuItem {
 struct IpcEnvelope {
     request: JsonRpcRequest,
     response_tx: Sender<JsonRpcResponse>,
+}
+
+struct SplitDrag {
+    pane_id: PaneId,
+    direction: SplitDirection,
 }
 
 impl App {
@@ -140,16 +165,113 @@ impl AppHandler {
         (state.last_mouse_pos.0 as f32, state.last_mouse_pos.1 as f32)
     }
 
-    fn sidebar_width(config: &Config, scale_factor: f64) -> f32 {
-        (config.sidebar.width as f32 * scale_factor as f32).max(0.0)
+    fn sidebar_rail_width(scale_factor: f64) -> f32 {
+        38.0 * scale_factor as f32
     }
 
-    fn pane_pixel_rect(state: &RunningState, config: &Config, pane_id: PaneId) -> Option<PixelRect> {
+    fn sidebar_panel_width(state: &RunningState) -> f32 {
+        if state.sidebar_visible {
+            state.sidebar_panel_width.max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn sidebar_total_width(state: &RunningState) -> f32 {
+        Self::sidebar_rail_width(state.scale_factor) + Self::sidebar_panel_width(state)
+    }
+
+    fn clamp_sidebar_panel_width(state: &RunningState, width: f32) -> f32 {
+        let scale = state.scale_factor as f32;
+        let min_w = 140.0 * scale;
+        let max_w = (state.renderer.width() as f32
+            - Self::sidebar_rail_width(state.scale_factor)
+            - 200.0 * scale)
+            .max(min_w);
+        width.clamp(min_w, max_w)
+    }
+
+    fn sidebar_toggle_button_rect(state: &RunningState) -> PixelRect {
+        let scale = state.scale_factor as f32;
+        let tab_h = state.renderer.text_renderer.tab_bar_height();
+        let rail_w = Self::sidebar_rail_width(state.scale_factor);
+        let btn_h = 28.0 * scale;
+        PixelRect {
+            x: 4.0 * scale,
+            y: tab_h + 8.0 * scale,
+            w: rail_w - 8.0 * scale,
+            h: btn_h,
+        }
+    }
+
+    fn session_button_rect(state: &RunningState) -> PixelRect {
+        let scale = state.scale_factor as f32;
+        let tab_h = state.renderer.text_renderer.tab_bar_height();
+        let rail_w = Self::sidebar_rail_width(state.scale_factor);
+        let btn_h = 28.0 * scale;
+        PixelRect {
+            x: 4.0 * scale,
+            y: tab_h + 8.0 * scale + (btn_h + 8.0 * scale) * 2.0,
+            w: rail_w - 8.0 * scale,
+            h: btn_h,
+        }
+    }
+
+    fn point_in_rect(x: f32, y: f32, rect: &PixelRect) -> bool {
+        x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h
+    }
+
+    fn sidebar_session_at_pixel(state: &RunningState, x: f32, y: f32) -> Option<usize> {
+        if !state.sidebar_visible {
+            return None;
+        }
+        let scale = state.scale_factor as f32;
+        let tab_h = state.renderer.text_renderer.tab_bar_height();
+        let rail_w = Self::sidebar_rail_width(state.scale_factor);
+        let panel_w = Self::sidebar_panel_width(state);
+        if x < rail_w || x > rail_w + panel_w || y < tab_h {
+            return None;
+        }
+
+        let card_x = rail_w + 8.0 * scale;
+        let card_w = (panel_w - 16.0 * scale).max(1.0);
+        let card_h = 52.0 * scale;
+        let gap = 8.0 * scale;
+        let mut cy = tab_h + 10.0 * scale;
+        for idx in 0..state.sessions.len() {
+            let rect = PixelRect {
+                x: card_x,
+                y: cy,
+                w: card_w,
+                h: card_h,
+            };
+            if Self::point_in_rect(x, y, &rect) {
+                return Some(idx);
+            }
+            cy += card_h + gap;
+        }
+        None
+    }
+
+    fn is_sidebar_divider_hit(state: &RunningState, x: f32, y: f32) -> bool {
+        if !state.sidebar_visible {
+            return false;
+        }
+        let tab_h = state.renderer.text_renderer.tab_bar_height();
+        if y < tab_h {
+            return false;
+        }
+        let scale = state.scale_factor as f32;
+        let divider_x = Self::sidebar_total_width(state);
+        (x - divider_x).abs() <= 4.0 * scale
+    }
+
+    fn pane_pixel_rect(state: &RunningState, pane_id: PaneId) -> Option<PixelRect> {
         let scale = state.scale_factor as f32;
         let w = state.renderer.width();
         let h = state.renderer.height();
         let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
-        let sidebar_w = Self::sidebar_width(config, state.scale_factor);
+        let sidebar_w = Self::sidebar_total_width(state);
         state
             .workspace_mgr
             .active_workspace()
@@ -160,7 +282,7 @@ impl AppHandler {
             .map(|(_, rect)| Self::pane_to_pixel_rect(&rect, w, h, scale, tab_bar_h, sidebar_w))
     }
 
-    fn pane_at_pixel(state: &RunningState, config: &Config, x: f32, y: f32) -> Option<PaneId> {
+    fn pane_at_pixel(state: &RunningState, x: f32, y: f32) -> Option<PaneId> {
         let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
         if y < tab_bar_h {
             return None;
@@ -168,7 +290,7 @@ impl AppHandler {
         let scale = state.scale_factor as f32;
         let w = state.renderer.width();
         let h = state.renderer.height();
-        let sidebar_w = Self::sidebar_width(config, state.scale_factor);
+        let sidebar_w = Self::sidebar_total_width(state);
         state
             .workspace_mgr
             .active_workspace()
@@ -188,10 +310,10 @@ impl AppHandler {
     }
 
     /// Convert mouse position to grid cell (col, row) for a specific pane
-    fn pixel_to_cell(state: &RunningState, config: &Config, pane_id: PaneId) -> (u16, u16) {
+    fn pixel_to_cell(state: &RunningState, pane_id: PaneId) -> (u16, u16) {
         let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
         let (mx, my) = Self::mouse_physical(state);
-        let pane_rect = Self::pane_pixel_rect(state, config, pane_id);
+        let pane_rect = Self::pane_pixel_rect(state, pane_id);
         let (px, py) = if let Some(rect) = pane_rect {
             (mx - rect.x, my - rect.y)
         } else {
@@ -202,7 +324,10 @@ impl AppHandler {
 
         if let Some(ps) = state.pane_states.get(&pane_id) {
             let (grid_cols, grid_rows) = ps.emulator.size();
-            (col.min(grid_cols.saturating_sub(1)), row.min(grid_rows.saturating_sub(1)))
+            (
+                col.min(grid_cols.saturating_sub(1)),
+                row.min(grid_rows.saturating_sub(1)),
+            )
         } else {
             (col, row)
         }
@@ -239,7 +364,11 @@ impl AppHandler {
                 text.push('\n');
             }
         }
-        if text.is_empty() { None } else { Some(text) }
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     fn grid_to_text(grid: &[pterminal_core::terminal::GridLine]) -> String {
@@ -261,7 +390,11 @@ impl AppHandler {
         out
     }
 
-    fn update_pane_metadata(config: &Config, pane: &mut PaneState, grid: &[pterminal_core::terminal::GridLine]) {
+    fn update_pane_metadata(
+        config: &Config,
+        pane: &mut PaneState,
+        grid: &[pterminal_core::terminal::GridLine],
+    ) {
         if config.sidebar.show_git_branch && pane.git_branch.is_none() {
             pane.git_branch = git_info::current_branch(&pane.cwd);
         }
@@ -274,6 +407,160 @@ impl AppHandler {
         } else if !pane.detected_ports.is_empty() {
             pane.detected_ports.clear();
         }
+    }
+
+    fn active_session_id(state: &RunningState) -> u64 {
+        state
+            .sessions
+            .get(state.active_session_idx)
+            .map(|s| s.id)
+            .unwrap_or(0)
+    }
+
+    fn resize_active_workspace_panes(state: &mut RunningState) {
+        let scale = state.scale_factor as f32;
+        let w = state.renderer.width();
+        let h = state.renderer.height();
+        let sidebar_w = Self::sidebar_total_width(state);
+        let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
+        let layout = state.workspace_mgr.active_workspace().split_tree.layout();
+        for (pane_id, pane_rect) in &layout {
+            let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale, tab_bar_h, sidebar_w);
+            let (cols, rows) = Self::pixel_rect_to_cols_rows(&px_rect, &state.renderer);
+            if let Some(ps) = state.pane_states.get(pane_id) {
+                ps.emulator.resize(cols, rows);
+                let _ = ps.pty.resize(cols, rows);
+                ps.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn switch_session(state: &mut RunningState, target_idx: usize) {
+        if target_idx >= state.sessions.len() || target_idx == state.active_session_idx {
+            return;
+        }
+
+        let current_id = Self::active_session_id(state);
+        let old_pane_ids: Vec<PaneId> = state.pane_states.keys().copied().collect();
+        for pid in &old_pane_ids {
+            state.renderer.text_renderer.remove_pane(*pid);
+        }
+
+        let current_snapshot = SessionSnapshot {
+            workspace_mgr: std::mem::take(&mut state.workspace_mgr),
+            pane_states: std::mem::take(&mut state.pane_states),
+            notifications: std::mem::take(&mut state.notifications),
+        };
+        state.parked_sessions.insert(current_id, current_snapshot);
+
+        let target_id = state.sessions[target_idx].id;
+        if let Some(target) = state.parked_sessions.remove(&target_id) {
+            state.workspace_mgr = target.workspace_mgr;
+            state.pane_states = target.pane_states;
+            state.notifications = target.notifications;
+            state.active_session_idx = target_idx;
+            state.selection = None;
+            state.context_menu = None;
+            Self::resize_active_workspace_panes(state);
+            Self::update_title(state);
+            state.window.request_redraw();
+        }
+    }
+
+    fn create_session(state: &mut RunningState, config: &Config) {
+        let current_id = Self::active_session_id(state);
+        let old_pane_ids: Vec<PaneId> = state.pane_states.keys().copied().collect();
+        for pid in &old_pane_ids {
+            state.renderer.text_renderer.remove_pane(*pid);
+        }
+        let current_snapshot = SessionSnapshot {
+            workspace_mgr: std::mem::take(&mut state.workspace_mgr),
+            pane_states: std::mem::take(&mut state.pane_states),
+            notifications: std::mem::take(&mut state.notifications),
+        };
+        state.parked_sessions.insert(current_id, current_snapshot);
+
+        let workspace_mgr = WorkspaceManager::new();
+        let pane_id: PaneId = workspace_mgr.active_workspace().active_pane();
+        let sidebar_w = Self::sidebar_total_width(state);
+        let (cols, rows) = Self::rect_to_cols_rows(&state.renderer, state.scale_factor, sidebar_w);
+        let ps = Self::spawn_pane(config, pane_id, cols, rows, &state.window);
+        let mut pane_states = HashMap::new();
+        pane_states.insert(pane_id, ps);
+
+        state.workspace_mgr = workspace_mgr;
+        state.pane_states = pane_states;
+        state.notifications = NotificationStore::new();
+
+        let sid = state.next_session_id;
+        state.next_session_id += 1;
+        state.sessions.push(SessionMeta {
+            id: sid,
+            name: format!("session {}", sid + 1),
+        });
+        state.active_session_idx = state.sessions.len() - 1;
+        state.selection = None;
+        state.context_menu = None;
+        Self::update_title(state);
+        state.window.request_redraw();
+    }
+
+    fn split_divider_hit(state: &RunningState, x: f32, y: f32) -> Option<SplitDrag> {
+        let scale = state.scale_factor as f32;
+        let threshold = 4.0 * scale;
+        let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
+        let sidebar_w = Self::sidebar_total_width(state);
+        let w = state.renderer.width();
+        let h = state.renderer.height();
+        let layout = state.workspace_mgr.active_workspace().split_tree.layout();
+
+        for (i, (a_id, a_rect_n)) in layout.iter().enumerate() {
+            let a = Self::pane_to_pixel_rect(a_rect_n, w, h, scale, tab_bar_h, sidebar_w);
+            for (b_id, b_rect_n) in layout.iter().skip(i + 1) {
+                let b = Self::pane_to_pixel_rect(b_rect_n, w, h, scale, tab_bar_h, sidebar_w);
+
+                let v_boundary =
+                    (a.x + a.w - b.x).abs() <= threshold || (b.x + b.w - a.x).abs() <= threshold;
+                if v_boundary {
+                    let divider_x = if (a.x + a.w - b.x).abs() <= threshold {
+                        a.x + a.w
+                    } else {
+                        b.x + b.w
+                    };
+                    let top = a.y.max(b.y);
+                    let bottom = (a.y + a.h).min(b.y + b.h);
+                    if bottom > top && (x - divider_x).abs() <= threshold && y >= top && y <= bottom
+                    {
+                        let left_is_a = a.x < b.x;
+                        return Some(SplitDrag {
+                            pane_id: if left_is_a { *a_id } else { *b_id },
+                            direction: SplitDirection::Horizontal,
+                        });
+                    }
+                }
+
+                let h_boundary =
+                    (a.y + a.h - b.y).abs() <= threshold || (b.y + b.h - a.y).abs() <= threshold;
+                if h_boundary {
+                    let divider_y = if (a.y + a.h - b.y).abs() <= threshold {
+                        a.y + a.h
+                    } else {
+                        b.y + b.h
+                    };
+                    let left = a.x.max(b.x);
+                    let right = (a.x + a.w).min(b.x + b.w);
+                    if right > left && (y - divider_y).abs() <= threshold && x >= left && x <= right
+                    {
+                        let top_is_a = a.y < b.y;
+                        return Some(SplitDrag {
+                            pane_id: if top_is_a { *a_id } else { *b_id },
+                            direction: SplitDirection::Vertical,
+                        });
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Find the word boundaries around a cell position
@@ -305,7 +592,10 @@ impl AppHandler {
                 }
             }
         }
-        Selection { start: (col, row), end: (col, row) }
+        Selection {
+            start: (col, row),
+            end: (col, row),
+        }
     }
 
     /// Select the entire line at the given row
@@ -317,7 +607,10 @@ impl AppHandler {
         } else {
             79
         };
-        Selection { start: (0, row), end: (max_col, row) }
+        Selection {
+            start: (0, row),
+            end: (max_col, row),
+        }
     }
 
     /// Spawn a new terminal pane and store its state
@@ -342,16 +635,23 @@ impl AppHandler {
         let window_for_redraw = window.clone();
         let dirty_for_pty = Arc::clone(&dirty);
 
-        let pty = PtyHandle::spawn(&shell, &cwd, cols, rows, move |data| {
-            emulator_handle.process(data);
-            dirty_for_pty.store(true, Ordering::Release);
-            window_for_redraw.request_redraw();
-        }, {
-            let window_exit = window.clone();
-            move || {
-                window_exit.request_redraw();
-            }
-        })
+        let pty = PtyHandle::spawn(
+            &shell,
+            &cwd,
+            cols,
+            rows,
+            move |data| {
+                emulator_handle.process(data);
+                dirty_for_pty.store(true, Ordering::Release);
+                window_for_redraw.request_redraw();
+            },
+            {
+                let window_exit = window.clone();
+                move || {
+                    window_exit.request_redraw();
+                }
+            },
+        )
         .expect("spawn PTY");
 
         info!(pane_id, cols, rows, %shell, "Pane spawned");
@@ -372,7 +672,8 @@ impl AppHandler {
         let (cell_w, cell_h) = renderer.text_renderer.cell_size();
         let padding = (6.0 * scale_factor as f32) as u32;
         let w = (renderer.width() as f32 - sidebar_w).max(1.0) as u32;
-        let h = (renderer.height() as f32 - renderer.text_renderer.tab_bar_height()).max(1.0) as u32;
+        let h =
+            (renderer.height() as f32 - renderer.text_renderer.tab_bar_height()).max(1.0) as u32;
         let cols = ((w - padding * 2) as f32 / cell_w).max(1.0) as u16;
         let rows = ((h - padding * 2) as f32 / cell_h).max(1.0) as u16;
         (cols, rows)
@@ -412,18 +713,27 @@ impl AppHandler {
         let idx = state.workspace_mgr.active_index() + 1;
         let count = state.workspace_mgr.workspace_count();
         let pane_count = state.workspace_mgr.active_workspace().pane_ids().len();
+        let session_name = state
+            .sessions
+            .get(state.active_session_idx)
+            .map(|s| s.name.as_str())
+            .unwrap_or("session");
         if pane_count > 1 {
-            state.window.set_title(&format!("pterminal [tab {idx}/{count}, {pane_count} panes]"));
+            state.window.set_title(&format!(
+                "pterminal [{session_name}] [tab {idx}/{count}, {pane_count} panes]"
+            ));
         } else {
-            state.window.set_title(&format!("pterminal [tab {idx}/{count}]"));
+            state
+                .window
+                .set_title(&format!("pterminal [{session_name}] [tab {idx}/{count}]"));
         }
     }
 
     /// Update IME candidate window position to match the terminal cursor
-    fn update_ime_cursor_area(state: &RunningState, config: &Config) {
+    fn update_ime_cursor_area(state: &RunningState) {
         let active = state.workspace_mgr.active_workspace().active_pane();
         let scale = state.scale_factor as f32;
-        let sidebar_w = Self::sidebar_width(config, state.scale_factor);
+        let sidebar_w = Self::sidebar_total_width(state);
         let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
 
         if let Some(ps) = state.pane_states.get(&active) {
@@ -566,8 +876,9 @@ impl AppHandler {
             }
             "workspace.new" | "new-workspace" => {
                 let (ws_id, pane_id) = state.workspace_mgr.add_workspace();
-                let sidebar_w = Self::sidebar_width(config, state.scale_factor);
-                let (cols, rows) = Self::rect_to_cols_rows(&state.renderer, state.scale_factor, sidebar_w);
+                let sidebar_w = Self::sidebar_total_width(state);
+                let (cols, rows) =
+                    Self::rect_to_cols_rows(&state.renderer, state.scale_factor, sidebar_w);
                 let ps = Self::spawn_pane(config, pane_id, cols, rows, &state.window);
                 state.pane_states.insert(pane_id, ps);
                 Self::update_title(state);
@@ -608,7 +919,10 @@ impl AppHandler {
                         .iter()
                         .position(|ws| ws.id == ws_id)
                 } else {
-                    params.get("index").and_then(Value::as_u64).map(|v| v as usize)
+                    params
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as usize)
                 };
                 let Some(index) = index else {
                     return JsonRpcResponse::invalid_params(id, "workspace id or index required");
@@ -725,7 +1039,10 @@ impl ApplicationHandler for AppHandler {
         ))
         .expect("create renderer");
 
-        let sidebar_w = Self::sidebar_width(&self.app.config, scale_factor);
+        let initial_sidebar_panel_width = (self.app.config.sidebar.width as f32
+            * scale_factor as f32)
+            .max(120.0 * scale_factor as f32);
+        let sidebar_w = Self::sidebar_rail_width(scale_factor) + initial_sidebar_panel_width;
         let (cols, rows) = Self::rect_to_cols_rows(&renderer, scale_factor, sidebar_w);
 
         // WorkspaceManager starts with workspace 0, pane 0
@@ -745,7 +1062,13 @@ impl ApplicationHandler for AppHandler {
             Arc::new(move |request: JsonRpcRequest| {
                 let req_id = request.id.clone();
                 let (resp_tx, resp_rx) = mpsc::channel();
-                if ipc_tx.send(IpcEnvelope { request, response_tx: resp_tx }).is_err() {
+                if ipc_tx
+                    .send(IpcEnvelope {
+                        request,
+                        response_tx: resp_tx,
+                    })
+                    .is_err()
+                {
                     return JsonRpcResponse::internal_error(req_id, "application unavailable");
                 }
                 match resp_rx.recv_timeout(Duration::from_secs(2)) {
@@ -783,9 +1106,20 @@ impl ApplicationHandler for AppHandler {
             fps_timer: Instant::now(),
             debug_timing,
             notifications: NotificationStore::new(),
+            sessions: vec![SessionMeta {
+                id: 0,
+                name: "conductor".to_string(),
+            }],
+            active_session_idx: 0,
+            next_session_id: 1,
+            parked_sessions: HashMap::new(),
             ipc_rx,
             _ipc_server: ipc_server,
             ipc_socket_path,
+            sidebar_visible: true,
+            sidebar_panel_width: initial_sidebar_panel_width,
+            sidebar_resizing: false,
+            split_drag: None,
         };
 
         Self::update_title(&running);
@@ -819,7 +1153,7 @@ impl ApplicationHandler for AppHandler {
                     winit::event::Ime::Enabled => {
                         state.ime_active = true;
                         // Set initial IME cursor area at current cursor position
-                        Self::update_ime_cursor_area(state, &self.app.config);
+                        Self::update_ime_cursor_area(state);
                     }
                     winit::event::Ime::Disabled => {
                         state.ime_active = false;
@@ -833,17 +1167,17 @@ impl ApplicationHandler for AppHandler {
                     }
                     winit::event::Ime::Preedit(_, _) => {
                         // Update candidate window position during composition
-                        Self::update_ime_cursor_area(state, &self.app.config);
+                        Self::update_ime_cursor_area(state);
                     }
                 }
             }
 
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 state.scale_factor = scale_factor;
-                state.renderer.text_renderer.update_scale_factor(
-                    scale_factor,
-                    self.app.config.font.size,
-                );
+                state
+                    .renderer
+                    .text_renderer
+                    .update_scale_factor(scale_factor, self.app.config.font.size);
                 // Mark all panes dirty
                 for ps in state.pane_states.values() {
                     ps.dirty.store(true, Ordering::Relaxed);
@@ -852,34 +1186,17 @@ impl ApplicationHandler for AppHandler {
 
             WindowEvent::Resized(new_size) => {
                 state.renderer.resize(new_size.width, new_size.height);
-
-                let scale = state.scale_factor as f32;
-                let w = new_size.width;
-                let h = new_size.height;
-                let sidebar_w = Self::sidebar_width(&self.app.config, state.scale_factor);
-
-                // Resize all panes in the active workspace based on their layout rects
-                let layout = state.workspace_mgr.active_workspace().split_tree.layout();
-                for (pane_id, pane_rect) in &layout {
-                    let px_rect = Self::pane_to_pixel_rect(
-                        pane_rect,
-                        w,
-                        h,
-                        scale,
-                        state.renderer.text_renderer.tab_bar_height(),
-                        sidebar_w,
-                    );
-                    let (cols, rows) = Self::pixel_rect_to_cols_rows(&px_rect, &state.renderer);
-                    if let Some(ps) = state.pane_states.get(pane_id) {
-                        ps.emulator.resize(cols, rows);
-                        let _ = ps.pty.resize(cols, rows);
-                        ps.dirty.store(true, Ordering::Relaxed);
-                    }
-                }
+                state.sidebar_panel_width =
+                    Self::clamp_sidebar_panel_width(state, state.sidebar_panel_width);
+                Self::resize_active_workspace_panes(state);
             }
 
             // Mouse events for selection
-            WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button: MouseButton::Left,
+                ..
+            } => {
                 let scale = state.scale_factor as f32;
                 let (phys_x, phys_y) = Self::mouse_physical(state);
 
@@ -890,7 +1207,9 @@ impl ApplicationHandler for AppHandler {
                         if let Some(action) = item {
                             match action {
                                 ContextMenuItem::Copy => {
-                                    if let Some(text) = Self::get_selected_text(state, &self.app.theme) {
+                                    if let Some(text) =
+                                        Self::get_selected_text(state, &self.app.theme)
+                                    {
                                         if let Some(clip) = &mut state.clipboard {
                                             let _ = clip.set_text(text);
                                         }
@@ -899,7 +1218,10 @@ impl ApplicationHandler for AppHandler {
                                 ContextMenuItem::Paste => {
                                     if let Some(clip) = &mut state.clipboard {
                                         if let Ok(text) = clip.get_text() {
-                                            let active = state.workspace_mgr.active_workspace().active_pane();
+                                            let active = state
+                                                .workspace_mgr
+                                                .active_workspace()
+                                                .active_pane();
                                             if let Some(ps) = state.pane_states.get(&active) {
                                                 let _ = ps.pty.write(text.as_bytes());
                                             }
@@ -910,6 +1232,40 @@ impl ApplicationHandler for AppHandler {
                         }
                         state.context_menu = None;
                         state.skip_next_release = true;
+                        state.window.request_redraw();
+                        return;
+                    }
+                }
+
+                if btn_state == ElementState::Pressed {
+                    let toggle_rect = Self::sidebar_toggle_button_rect(state);
+                    if Self::point_in_rect(phys_x, phys_y, &toggle_rect) {
+                        state.sidebar_visible = !state.sidebar_visible;
+                        Self::resize_active_workspace_panes(state);
+                        state.window.request_redraw();
+                        return;
+                    }
+
+                    let session_btn = Self::session_button_rect(state);
+                    if Self::point_in_rect(phys_x, phys_y, &session_btn) {
+                        Self::create_session(state, &self.app.config);
+                        return;
+                    }
+
+                    if let Some(session_idx) = Self::sidebar_session_at_pixel(state, phys_x, phys_y)
+                    {
+                        Self::switch_session(state, session_idx);
+                        return;
+                    }
+
+                    if Self::is_sidebar_divider_hit(state, phys_x, phys_y) {
+                        state.sidebar_resizing = true;
+                        return;
+                    }
+
+                    if let Some(drag) = Self::split_divider_hit(state, phys_x, phys_y) {
+                        state.split_drag = Some(drag);
+                        state.selection = None;
                         state.window.request_redraw();
                         return;
                     }
@@ -957,12 +1313,15 @@ impl ApplicationHandler for AppHandler {
 
                 match btn_state {
                     ElementState::Pressed => {
-                        let Some(clicked_pane) = Self::pane_at_pixel(state, &self.app.config, phys_x, phys_y) else {
+                        let Some(clicked_pane) = Self::pane_at_pixel(state, phys_x, phys_y) else {
                             return;
                         };
                         let prev_active = state.workspace_mgr.active_workspace().active_pane();
                         if prev_active != clicked_pane {
-                            state.workspace_mgr.active_workspace_mut().set_active_pane(clicked_pane);
+                            state
+                                .workspace_mgr
+                                .active_workspace_mut()
+                                .set_active_pane(clicked_pane);
                             for ps in state.pane_states.values() {
                                 ps.dirty.store(true, Ordering::Relaxed);
                             }
@@ -970,7 +1329,7 @@ impl ApplicationHandler for AppHandler {
 
                         state.mouse_pressed = true;
                         let active = state.workspace_mgr.active_workspace().active_pane();
-                        let cell = Self::pixel_to_cell(state, &self.app.config, active);
+                        let cell = Self::pixel_to_cell(state, active);
                         let now = Instant::now();
                         let double_click_threshold = Duration::from_millis(400);
                         // Count rapid clicks at same position
@@ -987,7 +1346,12 @@ impl ApplicationHandler for AppHandler {
                         match state.click_count {
                             2 => {
                                 // Double-click: select word
-                                state.selection = Some(Self::word_selection_at(state, &self.app.theme, cell.0, cell.1));
+                                state.selection = Some(Self::word_selection_at(
+                                    state,
+                                    &self.app.theme,
+                                    cell.0,
+                                    cell.1,
+                                ));
                             }
                             3 => {
                                 // Triple-click: select entire line
@@ -995,7 +1359,10 @@ impl ApplicationHandler for AppHandler {
                             }
                             _ => {
                                 // Single click: start new selection
-                                state.selection = Some(Selection { start: cell, end: cell });
+                                state.selection = Some(Selection {
+                                    start: cell,
+                                    end: cell,
+                                });
                             }
                         }
                         if let Some(ps) = state.pane_states.get(&active) {
@@ -1004,6 +1371,17 @@ impl ApplicationHandler for AppHandler {
                     }
                     ElementState::Released => {
                         state.mouse_pressed = false;
+                        if state.sidebar_resizing {
+                            state.sidebar_resizing = false;
+                            Self::resize_active_workspace_panes(state);
+                            state.window.request_redraw();
+                            return;
+                        }
+                        if state.split_drag.is_some() {
+                            state.split_drag = None;
+                            state.window.request_redraw();
+                            return;
+                        }
                         if state.skip_next_release {
                             state.skip_next_release = false;
                             return;
@@ -1013,7 +1391,8 @@ impl ApplicationHandler for AppHandler {
                             if let Some(sel) = &state.selection {
                                 if sel.start == sel.end {
                                     state.selection = None;
-                                    let active = state.workspace_mgr.active_workspace().active_pane();
+                                    let active =
+                                        state.workspace_mgr.active_workspace().active_pane();
                                     if let Some(ps) = state.pane_states.get(&active) {
                                         ps.dirty.store(true, Ordering::Relaxed);
                                     }
@@ -1025,11 +1404,18 @@ impl ApplicationHandler for AppHandler {
             }
 
             // Right-click context menu
-            WindowEvent::MouseInput { state: btn_state, button: MouseButton::Right, .. } => {
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button: MouseButton::Right,
+                ..
+            } => {
                 if btn_state == ElementState::Pressed {
                     let (phys_x, phys_y) = Self::mouse_physical(state);
-                    if let Some(clicked_pane) = Self::pane_at_pixel(state, &self.app.config, phys_x, phys_y) {
-                        state.workspace_mgr.active_workspace_mut().set_active_pane(clicked_pane);
+                    if let Some(clicked_pane) = Self::pane_at_pixel(state, phys_x, phys_y) {
+                        state
+                            .workspace_mgr
+                            .active_workspace_mut()
+                            .set_active_pane(clicked_pane);
                     } else {
                         return;
                     }
@@ -1049,11 +1435,43 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                let prev = state.last_mouse_pos;
                 state.last_mouse_pos = (position.x, position.y);
+                if state.sidebar_resizing {
+                    let rail_w = Self::sidebar_rail_width(state.scale_factor);
+                    let new_panel = (position.x as f32 - rail_w).max(0.0);
+                    state.sidebar_panel_width = Self::clamp_sidebar_panel_width(state, new_panel);
+                    Self::resize_active_workspace_panes(state);
+                    state.window.request_redraw();
+                    return;
+                }
+                if let Some(drag) = &state.split_drag {
+                    let dx = position.x as f32 - prev.0 as f32;
+                    let dy = position.y as f32 - prev.1 as f32;
+                    let content_w =
+                        (state.renderer.width() as f32 - Self::sidebar_total_width(state)).max(1.0);
+                    let content_h = (state.renderer.height() as f32
+                        - state.renderer.text_renderer.tab_bar_height())
+                    .max(1.0);
+                    let delta = match drag.direction {
+                        SplitDirection::Horizontal => dx / content_w,
+                        SplitDirection::Vertical => dy / content_h,
+                    };
+                    if delta.abs() > 0.0001 {
+                        state
+                            .workspace_mgr
+                            .active_workspace_mut()
+                            .split_tree
+                            .adjust_ratio(drag.pane_id, delta);
+                        Self::resize_active_workspace_panes(state);
+                        state.window.request_redraw();
+                    }
+                    return;
+                }
                 // Only drag-extend for single-click selections (not word/line)
                 if state.mouse_pressed && state.click_count <= 1 {
                     let active = state.workspace_mgr.active_workspace().active_pane();
-                    let cell = Self::pixel_to_cell(state, &self.app.config, active);
+                    let cell = Self::pixel_to_cell(state, active);
                     if let Some(sel) = &mut state.selection {
                         if sel.end != cell {
                             sel.end = cell;
@@ -1096,8 +1514,7 @@ impl ApplicationHandler for AppHandler {
                         match c.as_str() {
                             // Cmd+C: Copy selection
                             "c" => {
-                                if let Some(text) =
-                                    Self::get_selected_text(state, &self.app.theme)
+                                if let Some(text) = Self::get_selected_text(state, &self.app.theme)
                                 {
                                     if let Some(clip) = &mut state.clipboard {
                                         let _ = clip.set_text(text);
@@ -1109,7 +1526,8 @@ impl ApplicationHandler for AppHandler {
                             "v" => {
                                 if let Some(clip) = &mut state.clipboard {
                                     if let Ok(text) = clip.get_text() {
-                                        let active = state.workspace_mgr.active_workspace().active_pane();
+                                        let active =
+                                            state.workspace_mgr.active_workspace().active_pane();
                                         if let Some(ps) = state.pane_states.get(&active) {
                                             let _ = ps.pty.write(text.as_bytes());
                                         }
@@ -1120,9 +1538,19 @@ impl ApplicationHandler for AppHandler {
                             // Cmd+T: New workspace (tab)
                             "t" => {
                                 let (_ws_id, pane_id) = state.workspace_mgr.add_workspace();
-                                let sidebar_w = Self::sidebar_width(&self.app.config, state.scale_factor);
-                                let (cols, rows) = Self::rect_to_cols_rows(&state.renderer, state.scale_factor, sidebar_w);
-                                let ps = Self::spawn_pane(&self.app.config, pane_id, cols, rows, &state.window);
+                                let sidebar_w = Self::sidebar_total_width(state);
+                                let (cols, rows) = Self::rect_to_cols_rows(
+                                    &state.renderer,
+                                    state.scale_factor,
+                                    sidebar_w,
+                                );
+                                let ps = Self::spawn_pane(
+                                    &self.app.config,
+                                    pane_id,
+                                    cols,
+                                    rows,
+                                    &state.window,
+                                );
                                 state.pane_states.insert(pane_id, ps);
                                 Self::update_title(state);
                                 state.window.request_redraw();
@@ -1152,7 +1580,8 @@ impl ApplicationHandler for AppHandler {
                                 } else {
                                     SplitDirection::Horizontal
                                 };
-                                let active_pane = state.workspace_mgr.active_workspace().active_pane();
+                                let active_pane =
+                                    state.workspace_mgr.active_workspace().active_pane();
                                 let new_pane_id = state.workspace_mgr.next_pane_id();
                                 state.workspace_mgr.active_workspace_mut().split_tree.split(
                                     active_pane,
@@ -1164,9 +1593,12 @@ impl ApplicationHandler for AppHandler {
                                 let scale = state.scale_factor as f32;
                                 let w = state.renderer.width();
                                 let h = state.renderer.height();
-                                let sidebar_w = Self::sidebar_width(&self.app.config, state.scale_factor);
-                                let layout = state.workspace_mgr.active_workspace().split_tree.layout();
-                                let (cols, rows) = if let Some((_, pr)) = layout.iter().find(|(id, _)| *id == new_pane_id) {
+                                let sidebar_w = Self::sidebar_total_width(state);
+                                let layout =
+                                    state.workspace_mgr.active_workspace().split_tree.layout();
+                                let (cols, rows) = if let Some((_, pr)) =
+                                    layout.iter().find(|(id, _)| *id == new_pane_id)
+                                {
                                     let px = Self::pane_to_pixel_rect(
                                         pr,
                                         w,
@@ -1177,14 +1609,26 @@ impl ApplicationHandler for AppHandler {
                                     );
                                     Self::pixel_rect_to_cols_rows(&px, &state.renderer)
                                 } else {
-                                    Self::rect_to_cols_rows(&state.renderer, state.scale_factor, sidebar_w)
+                                    Self::rect_to_cols_rows(
+                                        &state.renderer,
+                                        state.scale_factor,
+                                        sidebar_w,
+                                    )
                                 };
 
-                                let ps = Self::spawn_pane(&self.app.config, new_pane_id, cols, rows, &state.window);
+                                let ps = Self::spawn_pane(
+                                    &self.app.config,
+                                    new_pane_id,
+                                    cols,
+                                    rows,
+                                    &state.window,
+                                );
                                 state.pane_states.insert(new_pane_id, ps);
 
                                 // Also resize the original pane since it shrunk
-                                if let Some((_, pr)) = layout.iter().find(|(id, _)| *id == active_pane) {
+                                if let Some((_, pr)) =
+                                    layout.iter().find(|(id, _)| *id == active_pane)
+                                {
                                     let px = Self::pane_to_pixel_rect(
                                         pr,
                                         w,
@@ -1193,14 +1637,18 @@ impl ApplicationHandler for AppHandler {
                                         state.renderer.text_renderer.tab_bar_height(),
                                         sidebar_w,
                                     );
-                                    let (c, r) = Self::pixel_rect_to_cols_rows(&px, &state.renderer);
+                                    let (c, r) =
+                                        Self::pixel_rect_to_cols_rows(&px, &state.renderer);
                                     if let Some(ops) = state.pane_states.get(&active_pane) {
                                         ops.emulator.resize(c, r);
                                         let _ = ops.pty.resize(c, r);
                                     }
                                 }
 
-                                state.workspace_mgr.active_workspace_mut().set_active_pane(new_pane_id);
+                                state
+                                    .workspace_mgr
+                                    .active_workspace_mut()
+                                    .set_active_pane(new_pane_id);
                                 Self::update_title(state);
                                 state.window.request_redraw();
                                 return;
@@ -1210,7 +1658,10 @@ impl ApplicationHandler for AppHandler {
                                 let ws = state.workspace_mgr.active_workspace();
                                 let current = ws.active_pane();
                                 if let Some(next) = ws.split_tree.next_pane(current) {
-                                    state.workspace_mgr.active_workspace_mut().set_active_pane(next);
+                                    state
+                                        .workspace_mgr
+                                        .active_workspace_mut()
+                                        .set_active_pane(next);
                                     state.window.request_redraw();
                                 }
                                 return;
@@ -1220,13 +1671,19 @@ impl ApplicationHandler for AppHandler {
                                 let ws = state.workspace_mgr.active_workspace();
                                 let current = ws.active_pane();
                                 if let Some(prev) = ws.split_tree.prev_pane(current) {
-                                    state.workspace_mgr.active_workspace_mut().set_active_pane(prev);
+                                    state
+                                        .workspace_mgr
+                                        .active_workspace_mut()
+                                        .set_active_pane(prev);
                                     state.window.request_redraw();
                                 }
                                 return;
                             }
                             // Cmd+1..9: Switch workspace
-                            s if s.len() == 1 && s.as_bytes()[0] >= b'1' && s.as_bytes()[0] <= b'9' => {
+                            s if s.len() == 1
+                                && s.as_bytes()[0] >= b'1'
+                                && s.as_bytes()[0] <= b'9' =>
+                            {
                                 let idx = (s.as_bytes()[0] - b'1') as usize;
                                 state.workspace_mgr.select_workspace(idx);
                                 Self::update_title(state);
@@ -1243,9 +1700,7 @@ impl ApplicationHandler for AppHandler {
                 if ctrl {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyC) if state.selection.is_some() => {
-                            if let Some(text) =
-                                Self::get_selected_text(state, &self.app.theme)
-                            {
+                            if let Some(text) = Self::get_selected_text(state, &self.app.theme) {
                                 if let Some(clip) = &mut state.clipboard {
                                     let _ = clip.set_text(text);
                                 }
@@ -1255,7 +1710,8 @@ impl ApplicationHandler for AppHandler {
                         PhysicalKey::Code(KeyCode::KeyV) => {
                             if let Some(clip) = &mut state.clipboard {
                                 if let Ok(text) = clip.get_text() {
-                                    let active = state.workspace_mgr.active_workspace().active_pane();
+                                    let active =
+                                        state.workspace_mgr.active_workspace().active_pane();
                                     if let Some(ps) = state.pane_states.get(&active) {
                                         let _ = ps.pty.write(text.as_bytes());
                                     }
@@ -1270,7 +1726,9 @@ impl ApplicationHandler for AppHandler {
                 // Clear selection on any other key press (but not modifier-only keys)
                 let is_modifier_only = matches!(
                     event.logical_key,
-                    Key::Named(NamedKey::Control | NamedKey::Shift | NamedKey::Super | NamedKey::Alt)
+                    Key::Named(
+                        NamedKey::Control | NamedKey::Shift | NamedKey::Super | NamedKey::Alt
+                    )
                 );
                 if state.selection.is_some() && !is_modifier_only {
                     state.selection = None;
@@ -1323,70 +1781,69 @@ impl ApplicationHandler for AppHandler {
                 let tab_fg = RgbColor::new(0x88, 0x88, 0x88);
                 let tab_active_fg = theme.colors.foreground;
                 state.renderer.text_renderer.set_tab_bar(
-                    &tabs, tab_bar_bg, tab_active_bg, tab_fg, tab_active_fg,
+                    &tabs,
+                    tab_bar_bg,
+                    tab_active_bg,
+                    tab_fg,
+                    tab_active_fg,
                 );
                 let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
-                let sidebar_w = Self::sidebar_width(&self.app.config, state.scale_factor);
+                let rail_w = Self::sidebar_rail_width(state.scale_factor);
+                let panel_w = Self::sidebar_panel_width(state);
+                let sidebar_w = rail_w + panel_w;
 
-                let mut sidebar_lines = Vec::new();
-                let active_ws = state.workspace_mgr.active_workspace();
-                let active_pane = active_ws.active_pane();
-                sidebar_lines.push(format!("Workspace {}", active_ws.id));
-                sidebar_lines.push(String::new());
-                for pane_id in active_ws.pane_ids() {
-                    let marker = if pane_id == active_pane { ">" } else { " " };
-                    sidebar_lines.push(format!("{marker} Pane {}", pane_id));
-                    if let Some(ps) = state.pane_states.get(&pane_id) {
-                        if self.app.config.sidebar.show_cwd {
-                            if let Some(name) = ps.cwd.file_name().and_then(|n| n.to_str()) {
-                                sidebar_lines.push(format!("  cwd: {name}"));
-                            } else if let Some(cwd) = ps.cwd.to_str() {
-                                sidebar_lines.push(format!("  cwd: {cwd}"));
-                            }
-                        }
-                        if self.app.config.sidebar.show_git_branch {
-                            if let Some(branch) = &ps.git_branch {
-                                sidebar_lines.push(format!("  git: {branch}"));
-                            }
-                        }
-                        if self.app.config.sidebar.show_ports && !ps.detected_ports.is_empty() {
-                            let ports: Vec<String> = ps
-                                .detected_ports
-                                .iter()
-                                .take(3)
-                                .map(|p| p.to_string())
-                                .collect();
-                            let mut ports_line = ports.join(", ");
-                            if ps.detected_ports.len() > ports.len() {
-                                ports_line.push_str(", ...");
-                            }
-                            sidebar_lines.push(format!("  ports: {ports_line}"));
-                        }
+                let rail_lines = vec![
+                    "≡".to_string(),
+                    String::new(),
+                    "◌".to_string(),
+                    String::new(),
+                    "+".to_string(),
+                ];
+                let mut panel_lines = Vec::new();
+                if state.sidebar_visible {
+                    for (idx, session) in state.sessions.iter().enumerate() {
+                        let active_mark = if idx == state.active_session_idx {
+                            "●"
+                        } else {
+                            "○"
+                        };
+                        panel_lines.push(format!("{active_mark} {}", session.name));
+                        panel_lines.push("~".to_string());
+                        panel_lines.push(String::new());
                     }
-                    sidebar_lines.push(String::new());
-                }
-                if self.app.config.sidebar.show_notification_badge {
-                    sidebar_lines.push(format!(
-                        "Notifications: {}",
-                        state.notifications.unread_count()
-                    ));
+                    if self.app.config.sidebar.show_notification_badge {
+                        panel_lines.push(format!(
+                            "notifications: {}",
+                            state.notifications.unread_count()
+                        ));
+                    }
                 }
                 state.renderer.text_renderer.set_sidebar(
-                    sidebar_w,
-                    &sidebar_lines,
+                    rail_w,
+                    panel_w,
+                    &rail_lines,
+                    &panel_lines,
+                    state.sessions.len(),
+                    state.active_session_idx,
+                    RgbColor::new(0x1f, 0x22, 0x2a),
                     RgbColor::new(0x20, 0x21, 0x2b),
                     theme.colors.foreground,
                 );
 
                 // Update context menu overlay
                 if let Some(ref menu) = state.context_menu {
-                    let items: Vec<(&str, bool)> = menu.items.iter().map(|item| {
-                        match item {
+                    let items: Vec<(&str, bool)> = menu
+                        .items
+                        .iter()
+                        .map(|item| match item {
                             ContextMenuItem::Copy => ("Copy", true),
                             ContextMenuItem::Paste => ("Paste", true),
-                        }
-                    }).collect();
-                    state.renderer.text_renderer.set_context_menu(menu.x, menu.y, &items);
+                        })
+                        .collect();
+                    state
+                        .renderer
+                        .text_renderer
+                        .set_context_menu(menu.x, menu.y, &items);
                 } else {
                     state.renderer.text_renderer.clear_context_menu();
                 }
@@ -1407,7 +1864,10 @@ impl ApplicationHandler for AppHandler {
                         state.renderer.text_renderer.remove_pane(*pid);
                     }
                     // Close workspaces that contain dead panes
-                    let ws_ids: Vec<_> = state.workspace_mgr.workspaces().iter()
+                    let ws_ids: Vec<_> = state
+                        .workspace_mgr
+                        .workspaces()
+                        .iter()
                         .filter(|ws| ws.pane_ids().iter().any(|p| dead_panes.contains(p)))
                         .map(|ws| ws.id)
                         .collect();
@@ -1435,7 +1895,8 @@ impl ApplicationHandler for AppHandler {
 
                 let t_grid = Instant::now();
                 for (pane_id, pane_rect) in &layout {
-                    let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale, tab_bar_h, sidebar_w);
+                    let px_rect =
+                        Self::pane_to_pixel_rect(pane_rect, w, h, scale, tab_bar_h, sidebar_w);
 
                     if let Some(ps) = state.pane_states.get_mut(pane_id) {
                         let show_cursor = *pane_id == active_pane;
@@ -1483,12 +1944,10 @@ impl ApplicationHandler for AppHandler {
 
                     // Prepare background cell colors
                     let bg_rects = state.renderer.text_renderer.collect_bg_rects(&pane_rects);
-                    state.renderer.bg_renderer.prepare(
-                        &state.renderer.queue,
-                        &bg_rects,
-                        w,
-                        h,
-                    );
+                    state
+                        .renderer
+                        .bg_renderer
+                        .prepare(&state.renderer.queue, &bg_rects, w, h);
 
                     // Prepare overlay (context menu) bg — rendered after text
                     let overlay_rects = state.renderer.text_renderer.collect_overlay_bg_rects();
@@ -1508,9 +1967,7 @@ impl ApplicationHandler for AppHandler {
                     let prep_dur = t_prep.elapsed();
 
                     let t_render = Instant::now();
-                    let _ = state
-                        .renderer
-                        .render_frame(theme.colors.background, |_| {});
+                    let _ = state.renderer.render_frame(theme.colors.background, |_| {});
                     let render_dur = t_render.elapsed();
 
                     if state.debug_timing {
@@ -1531,9 +1988,9 @@ impl ApplicationHandler for AppHandler {
                     state.fps_timer = Instant::now();
                     let idx = state.workspace_mgr.active_index() + 1;
                     let count = state.workspace_mgr.workspace_count();
-                    state.window.set_title(&format!(
-                        "pterminal [tab {idx}/{count}] {fps:.0} fps"
-                    ));
+                    state
+                        .window
+                        .set_title(&format!("pterminal [tab {idx}/{count}] {fps:.0} fps"));
                 }
             }
 
@@ -1546,7 +2003,10 @@ impl ApplicationHandler for AppHandler {
             Self::handle_ipc_requests(state, &self.app.config, &self.app.theme, event_loop);
             let active_panes = state.workspace_mgr.active_workspace().pane_ids();
             let any_dirty = active_panes.iter().any(|pid| {
-                state.pane_states.get(pid).map_or(false, |ps| ps.dirty.load(Ordering::Relaxed))
+                state
+                    .pane_states
+                    .get(pid)
+                    .map_or(false, |ps| ps.dirty.load(Ordering::Relaxed))
             });
             if any_dirty {
                 state.window.request_redraw();

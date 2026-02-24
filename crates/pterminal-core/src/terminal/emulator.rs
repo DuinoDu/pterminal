@@ -58,7 +58,10 @@ impl TerminalEmulator {
     /// Process raw bytes from PTY output (persistent VTE parser state)
     pub fn process(&self, data: &[u8]) {
         let mut inner = self.inner.lock().unwrap();
-        let TermInner { ref mut term, ref mut processor } = *inner;
+        let TermInner {
+            ref mut term,
+            ref mut processor,
+        } = *inner;
         processor.advance(term, data);
     }
 
@@ -74,7 +77,10 @@ impl TerminalEmulator {
     /// Get current dimensions
     pub fn size(&self) -> (u16, u16) {
         let inner = self.inner.lock().unwrap();
-        (inner.term.columns() as u16, inner.term.screen_lines() as u16)
+        (
+            inner.term.columns() as u16,
+            inner.term.screen_lines() as u16,
+        )
     }
 
     /// Resize the terminal
@@ -129,10 +135,8 @@ impl TerminalEmulator {
             // line_idx 0 with offset N → Line(-(N as i32))
             let actual_line = line_idx as i32 - display_offset as i32;
             for col_idx in 0..num_cols {
-                let point = alacritty_terminal::index::Point::new(
-                    Line(actual_line),
-                    Column(col_idx),
-                );
+                let point =
+                    alacritty_terminal::index::Point::new(Line(actual_line), Column(col_idx));
                 let cell = &grid[point];
                 let fg = alacritty_color_to_rgb(&cell.fg, theme);
                 let bg = alacritty_color_to_rgb(&cell.bg, theme);
@@ -163,7 +167,10 @@ pub struct TerminalEmulatorHandle {
 impl TerminalEmulatorHandle {
     pub fn process(&self, data: &[u8]) {
         let mut inner = self.inner.lock().unwrap();
-        let TermInner { ref mut term, ref mut processor } = *inner;
+        let TermInner {
+            ref mut term,
+            ref mut processor,
+        } = *inner;
         processor.advance(term, data);
     }
 }

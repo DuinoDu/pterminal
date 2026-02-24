@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
-    Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonTextRenderer,
-    Viewport, Weight,
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonTextRenderer, Viewport,
+    Weight,
 };
 
 use pterminal_core::config::theme::RgbColor;
@@ -94,10 +94,14 @@ struct ContextMenuOverlay {
 
 /// Sidebar panel (drawn in main layer)
 struct SidebarPanel {
-    buffer: Buffer,
-    text_x: f32,
-    text_y: f32,
-    w: f32,
+    rail_buffer: Buffer,
+    panel_buffer: Buffer,
+    rail_text_x: f32,
+    rail_text_y: f32,
+    panel_text_x: f32,
+    panel_text_y: f32,
+    rail_w: f32,
+    panel_w: f32,
     h: f32,
     bg_rects: Vec<crate::bg::BgRect>,
 }
@@ -182,11 +186,14 @@ impl TextRenderer {
         selection_bg: RgbColor,
     ) {
         let metrics = Metrics::new(self.font_size, self.line_height);
-        let pb = self.pane_buffers.entry(pane_id).or_insert_with(|| PaneBuffer {
-            lines: Vec::new(),
-            bg_cells: Vec::new(),
-            cursor: None,
-        });
+        let pb = self
+            .pane_buffers
+            .entry(pane_id)
+            .or_insert_with(|| PaneBuffer {
+                lines: Vec::new(),
+                bg_cells: Vec::new(),
+                cursor: None,
+            });
 
         // Ensure correct number of line buffers
         while pb.lines.len() < grid.len() {
@@ -225,7 +232,9 @@ impl TextRenderer {
                 1.0,
             ];
             for row in start.1..=end.1 {
-                if row as usize >= grid.len() { break; }
+                if row as usize >= grid.len() {
+                    break;
+                }
                 let col_start = if row == start.1 { start.0 } else { 0 };
                 let col_end = if row == end.1 {
                     end.0 + 1
@@ -245,12 +254,16 @@ impl TextRenderer {
         // Store cursor for vertical bar rendering in collect_bg_rects
         let (cursor_col, cursor_row) = cursor_pos;
         if cursor_visible {
-            pb.cursor = Some((cursor_col, cursor_row, [
-                cursor_color.r as f32 / 255.0,
-                cursor_color.g as f32 / 255.0,
-                cursor_color.b as f32 / 255.0,
-                1.0,
-            ]));
+            pb.cursor = Some((
+                cursor_col,
+                cursor_row,
+                [
+                    cursor_color.r as f32 / 255.0,
+                    cursor_color.g as f32 / 255.0,
+                    cursor_color.b as f32 / 255.0,
+                    1.0,
+                ],
+            ));
         } else {
             pb.cursor = None;
         }
@@ -316,11 +329,8 @@ impl TextRenderer {
         for (pane_id, rect) in panes {
             if let Some(pb) = self.pane_buffers.get_mut(pane_id) {
                 for lb in &mut pb.lines {
-                    lb.buffer.set_size(
-                        &mut self.font_system,
-                        Some(rect.w),
-                        Some(self.line_height),
-                    );
+                    lb.buffer
+                        .set_size(&mut self.font_system, Some(rect.w), Some(self.line_height));
                 }
             }
         }
@@ -353,15 +363,29 @@ impl TextRenderer {
         // Sidebar text
         if let Some(ref sb) = self.sidebar {
             text_areas.push(TextArea {
-                buffer: &sb.buffer,
-                left: sb.text_x,
-                top: sb.text_y,
+                buffer: &sb.rail_buffer,
+                left: sb.rail_text_x,
+                top: sb.rail_text_y,
                 scale: 1.0,
                 bounds: TextBounds {
-                    left: sb.text_x as i32,
-                    top: sb.text_y as i32,
-                    right: (sb.text_x + sb.w) as i32,
-                    bottom: (sb.text_y + sb.h) as i32,
+                    left: sb.rail_text_x as i32,
+                    top: sb.rail_text_y as i32,
+                    right: (sb.rail_text_x + sb.rail_w) as i32,
+                    bottom: (sb.rail_text_y + sb.h) as i32,
+                },
+                default_color: default_glyphon_color,
+                custom_glyphs: &[],
+            });
+            text_areas.push(TextArea {
+                buffer: &sb.panel_buffer,
+                left: sb.panel_text_x,
+                top: sb.panel_text_y,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: sb.panel_text_x as i32,
+                    top: sb.panel_text_y as i32,
+                    right: (sb.panel_text_x + sb.panel_w) as i32,
+                    bottom: (sb.panel_text_y + sb.h) as i32,
                 },
                 default_color: default_glyphon_color,
                 custom_glyphs: &[],
@@ -404,7 +428,8 @@ impl TextRenderer {
         // Context menu text — separate prepare for overlay rendering
         let mut overlay_areas: Vec<TextArea<'_>> = Vec::new();
         if let Some(ref cm) = self.context_menu {
-            let default_glyphon_color2 = Color::rgb(default_color.r, default_color.g, default_color.b);
+            let default_glyphon_color2 =
+                Color::rgb(default_color.r, default_color.g, default_color.b);
             overlay_areas.push(TextArea {
                 buffer: &cm.buffer,
                 left: cm.x,
@@ -519,7 +544,9 @@ impl TextRenderer {
 
     /// Returns sidebar width in physical pixels (0 if hidden)
     pub fn sidebar_width(&self) -> f32 {
-        self.sidebar.as_ref().map_or(0.0, |sb| sb.w)
+        self.sidebar
+            .as_ref()
+            .map_or(0.0, |sb| sb.rail_w + sb.panel_w)
     }
 
     /// Update tab bar content. Pass empty slice to hide.
@@ -602,7 +629,11 @@ impl TextRenderer {
 
             // Tab label (left-aligned)
             let mut label_buf = Buffer::new(&mut self.font_system, metrics);
-            label_buf.set_size(&mut self.font_system, Some(tab_width - close_btn_w), Some(tab_height));
+            label_buf.set_size(
+                &mut self.font_system,
+                Some(tab_width - close_btn_w),
+                Some(tab_height),
+            );
             let label_text = format!("  {}", label);
             label_buf.set_rich_text(
                 &mut self.font_system,
@@ -640,12 +671,17 @@ impl TextRenderer {
     /// Update left sidebar content.
     pub fn set_sidebar(
         &mut self,
-        width: f32,
-        lines: &[String],
-        bg: RgbColor,
+        rail_width: f32,
+        panel_width: f32,
+        rail_lines: &[String],
+        panel_lines: &[String],
+        session_count: usize,
+        active_session_idx: usize,
+        rail_bg: RgbColor,
+        panel_bg: RgbColor,
         fg: RgbColor,
     ) {
-        if width <= 0.0 {
+        if rail_width <= 0.0 && panel_width <= 0.0 {
             self.sidebar = None;
             return;
         }
@@ -656,55 +692,119 @@ impl TextRenderer {
         let pad = 8.0 * scale;
         let border_w = 1.0 * scale;
 
-        let mut bg_rects = Vec::with_capacity(2);
+        let total_w = rail_width + panel_width;
+        let mut bg_rects = Vec::with_capacity(3);
         bg_rects.push(crate::bg::BgRect {
             x: 0.0,
             y: tab_h,
-            w: width,
+            w: rail_width,
             h: panel_h,
             color: [
-                bg.r as f32 / 255.0,
-                bg.g as f32 / 255.0,
-                bg.b as f32 / 255.0,
+                rail_bg.r as f32 / 255.0,
+                rail_bg.g as f32 / 255.0,
+                rail_bg.b as f32 / 255.0,
                 1.0,
             ],
         });
         bg_rects.push(crate::bg::BgRect {
-            x: (width - border_w).max(0.0),
+            x: rail_width,
+            y: tab_h,
+            w: panel_width,
+            h: panel_h,
+            color: [
+                panel_bg.r as f32 / 255.0,
+                panel_bg.g as f32 / 255.0,
+                panel_bg.b as f32 / 255.0,
+                1.0,
+            ],
+        });
+        bg_rects.push(crate::bg::BgRect {
+            x: (total_w - border_w).max(0.0),
             y: tab_h,
             w: border_w,
             h: panel_h,
             color: [0.32, 0.33, 0.38, 1.0],
         });
+        if panel_width > 0.0 {
+            let card_x = rail_width + 8.0 * scale;
+            let card_w = (panel_width - 16.0 * scale).max(1.0);
+            let card_h = 52.0 * scale;
+            let card_gap = 8.0 * scale;
+            let mut card_y = tab_h + 10.0 * scale;
+            for i in 0..session_count {
+                let color = if i == active_session_idx {
+                    [0.09, 0.47, 0.91, 1.0]
+                } else {
+                    [0.16, 0.18, 0.23, 1.0]
+                };
+                bg_rects.push(crate::bg::BgRect {
+                    x: card_x,
+                    y: card_y,
+                    w: card_w,
+                    h: card_h,
+                    color,
+                });
+                card_y += card_h + card_gap;
+            }
+        }
 
-        let font_size = self.font_size * 0.78;
-        let line_h = self.line_height * 0.95;
-        let metrics = Metrics::new(font_size, line_h);
-        let mut buffer = Buffer::new(&mut self.font_system, metrics);
-        let text_w = (width - pad * 2.0).max(1.0);
-        let text_h = (panel_h - pad * 2.0).max(1.0);
-        buffer.set_size(&mut self.font_system, Some(text_w), Some(text_h));
+        let panel_font_size = self.font_size * 0.78;
+        let panel_line_h = self.line_height * 0.95;
+        let panel_metrics = Metrics::new(panel_font_size, panel_line_h);
+        let mut panel_buffer = Buffer::new(&mut self.font_system, panel_metrics);
+        let panel_text_w = (panel_width - pad * 2.0).max(1.0);
+        let panel_text_h = (panel_h - pad * 2.0).max(1.0);
+        panel_buffer.set_size(
+            &mut self.font_system,
+            Some(panel_text_w),
+            Some(panel_text_h),
+        );
 
-        let text = if lines.is_empty() {
+        let panel_text = if panel_lines.is_empty() {
             String::new()
         } else {
-            lines.join("\n")
+            panel_lines.join("\n")
         };
+
+        let rail_font_size = self.font_size * 0.88;
+        let rail_line_h = self.line_height * 1.1;
+        let rail_metrics = Metrics::new(rail_font_size, rail_line_h);
+        let mut rail_buffer = Buffer::new(&mut self.font_system, rail_metrics);
+        let rail_text_w = (rail_width - pad * 1.2).max(1.0);
+        let rail_text_h = (panel_h - pad * 2.0).max(1.0);
+        rail_buffer.set_size(&mut self.font_system, Some(rail_text_w), Some(rail_text_h));
+        let rail_text = if rail_lines.is_empty() {
+            String::new()
+        } else {
+            rail_lines.join("\n")
+        };
+
         let default_attrs = Attrs::new().family(Family::Monospace);
         let attrs = default_attrs.color(Color::rgb(fg.r, fg.g, fg.b));
-        buffer.set_rich_text(
+        panel_buffer.set_rich_text(
             &mut self.font_system,
-            [(&text as &str, attrs)],
+            [(&panel_text as &str, attrs)],
             default_attrs,
             Shaping::Advanced,
         );
-        buffer.shape_until_scroll(&mut self.font_system, false);
+        panel_buffer.shape_until_scroll(&mut self.font_system, false);
+        rail_buffer.set_rich_text(
+            &mut self.font_system,
+            [(&rail_text as &str, attrs)],
+            default_attrs,
+            Shaping::Advanced,
+        );
+        rail_buffer.shape_until_scroll(&mut self.font_system, false);
 
         self.sidebar = Some(SidebarPanel {
-            buffer,
-            text_x: pad,
-            text_y: tab_h + pad,
-            w: width,
+            rail_buffer,
+            panel_buffer,
+            rail_text_x: pad * 0.6,
+            rail_text_y: tab_h + pad,
+            panel_text_x: rail_width + pad,
+            panel_text_y: tab_h + pad,
+            rail_w: rail_width,
+            panel_w: panel_width,
             h: panel_h,
             bg_rects,
         });
@@ -788,7 +888,12 @@ impl TextRenderer {
             .iter()
             .map(|(s, e)| (&text[*s..*e], default_attrs.color(fg_color)))
             .collect();
-        buffer.set_rich_text(&mut self.font_system, rich, default_attrs, Shaping::Advanced);
+        buffer.set_rich_text(
+            &mut self.font_system,
+            rich,
+            default_attrs,
+            Shaping::Advanced,
+        );
         buffer.shape_until_scroll(&mut self.font_system, false);
 
         self.context_menu = Some(ContextMenuOverlay {
@@ -822,9 +927,7 @@ fn hash_line(line: &GridLine) -> u64 {
 }
 
 /// Build rich text spans for a single terminal line
-fn build_line_rich_text(
-    line: &GridLine,
-) -> (String, Vec<RichSpan>) {
+fn build_line_rich_text(line: &GridLine) -> (String, Vec<RichSpan>) {
     let mut text = String::with_capacity(line.cells.len());
     let mut spans: Vec<RichSpan> = Vec::with_capacity(8);
 

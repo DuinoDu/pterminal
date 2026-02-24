@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use pterminal_ipc::IpcClient;
 
@@ -64,9 +64,7 @@ enum Command {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let socket = cli
-        .socket
-        .unwrap_or_else(IpcClient::default_socket_path);
+    let socket = cli.socket.unwrap_or_else(IpcClient::default_socket_path);
     let client = IpcClient::new(socket);
 
     let result = match cli.command {
@@ -98,7 +96,9 @@ async fn main() -> Result<()> {
                 .await?
         }
         Command::CapturePane { pane_id } => {
-            client.call("pane.capture", json!({ "pane_id": pane_id })).await?
+            client
+                .call("pane.capture", json!({ "pane_id": pane_id }))
+                .await?
         }
         Command::Notify { title, body } => {
             client
