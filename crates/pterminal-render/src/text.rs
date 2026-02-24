@@ -159,6 +159,8 @@ impl TextRenderer {
         cursor_visible: bool,
         cursor_color: RgbColor,
         default_bg: RgbColor,
+        selection: Option<((u16, u16), (u16, u16))>, // normalized (start, end) or None
+        selection_bg: RgbColor,
     ) {
         let metrics = Metrics::new(self.font_size, self.line_height);
         let pb = self.pane_buffers.entry(pane_id).or_insert_with(|| PaneBuffer {
@@ -190,6 +192,32 @@ impl TextRenderer {
                             cell.bg.b as f32 / 255.0,
                             1.0,
                         ],
+                    });
+                }
+            }
+        }
+
+        // Selection highlight bg cells
+        if let Some((start, end)) = selection {
+            let sel_color = [
+                selection_bg.r as f32 / 255.0,
+                selection_bg.g as f32 / 255.0,
+                selection_bg.b as f32 / 255.0,
+                1.0,
+            ];
+            for row in start.1..=end.1 {
+                if row as usize >= grid.len() { break; }
+                let col_start = if row == start.1 { start.0 } else { 0 };
+                let col_end = if row == end.1 {
+                    end.0 + 1
+                } else {
+                    grid[row as usize].cells.len() as u16
+                };
+                for col in col_start..col_end {
+                    pb.bg_cells.push(BgCell {
+                        col,
+                        row,
+                        color: sel_color,
                     });
                 }
             }
@@ -529,37 +557,37 @@ impl TextRenderer {
         items: &[(&str, bool)], // (label, enabled)
     ) {
         let scale = self.scale_factor;
-        let item_h = 28.0 * scale;
-        let menu_w = 120.0 * scale;
-        let menu_h = items.len() as f32 * item_h;
+        let item_h = 30.0 * scale;
+        let menu_w = 140.0 * scale;
+        let menu_h = items.len() as f32 * item_h + 4.0 * scale; // 2px padding top+bottom
         let pad = 6.0 * scale;
-        let font_size = self.font_size * 0.75;
+        let font_size = self.font_size * 0.8;
+        let border = 1.0 * scale;
 
         // Clamp to screen
         let mx = x.min(self.width as f32 - menu_w - pad);
         let my = y.min(self.height as f32 - menu_h - pad);
 
-        // Background rect (dark panel)
-        let mut bg_rects = vec![crate::bg::BgRect {
+        let mut bg_rects = Vec::new();
+        // Border (light gray outline)
+        bg_rects.push(crate::bg::BgRect {
+            x: mx - border,
+            y: my - border,
+            w: menu_w + border * 2.0,
+            h: menu_h + border * 2.0,
+            color: [0.45, 0.45, 0.50, 1.0], // gray border
+        });
+        // Background (solid dark)
+        bg_rects.push(crate::bg::BgRect {
             x: mx,
             y: my,
             w: menu_w,
             h: menu_h,
-            color: [0.15, 0.15, 0.18, 1.0],
-        }];
-
-        // Hover areas (items)
-        for i in 0..items.len() {
-            bg_rects.push(crate::bg::BgRect {
-                x: mx,
-                y: my + i as f32 * item_h,
-                w: menu_w,
-                h: item_h,
-                color: [0.15, 0.15, 0.18, 1.0],
-            });
-        }
+            color: [0.20, 0.20, 0.24, 1.0], // #333
+        });
 
         // Text buffer
+        let y_offset = 2.0 * scale;
         let metrics = Metrics::new(font_size, item_h);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(&mut self.font_system, Some(menu_w), Some(menu_h));
@@ -576,7 +604,7 @@ impl TextRenderer {
         }
 
         let default_attrs = Attrs::new().family(Family::Monospace);
-        let fg_color = Color::rgb(0xee, 0xee, 0xee);
+        let fg_color = Color::rgb(0xff, 0xff, 0xff);
         let rich: Vec<(&str, Attrs)> = spans
             .iter()
             .map(|(s, e)| (&text[*s..*e], default_attrs.color(fg_color)))
@@ -587,7 +615,7 @@ impl TextRenderer {
         self.context_menu = Some(ContextMenuOverlay {
             buffer,
             x: mx,
-            y: my,
+            y: my + y_offset,
             w: menu_w,
             h: menu_h,
             bg_rects,

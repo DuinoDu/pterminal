@@ -283,8 +283,8 @@ impl AppHandler {
         phys_y: f32,
         scale: f32,
     ) -> Option<ContextMenuItem> {
-        let item_h = 28.0 * scale;
-        let menu_w = 120.0 * scale;
+        let item_h = 30.0 * scale;
+        let menu_w = 140.0 * scale;
         let menu_x = menu.x;
         let menu_y = menu.y;
 
@@ -819,9 +819,14 @@ impl ApplicationHandler for AppHandler {
                         let content_dirty = ps.dirty.load(Ordering::Acquire);
                         let cursor_changed = ps.last_cursor_visible != show_cursor;
 
-                        if content_dirty || cursor_changed {
+                        if content_dirty || cursor_changed || state.selection.is_some() {
                             let grid = ps.emulator.extract_grid(theme);
                             let cursor_pos = ps.emulator.cursor_position();
+                            let sel = if *pane_id == active_pane {
+                                state.selection.map(|s| s.normalized())
+                            } else {
+                                None
+                            };
 
                             state.renderer.text_renderer.set_pane_content(
                                 *pane_id,
@@ -830,6 +835,8 @@ impl ApplicationHandler for AppHandler {
                                 show_cursor,
                                 cursor_color,
                                 theme.colors.background,
+                                sel,
+                                theme.colors.selection_bg,
                             );
                             ps.last_cursor_visible = show_cursor;
                             ps.dirty.store(false, Ordering::Relaxed);
