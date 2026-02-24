@@ -245,9 +245,10 @@ impl AppHandler {
                 let h = state.renderer.height();
                 let pr = Self::pane_to_pixel_rect(rect, w, h, scale);
 
-                // Position below the cursor line (physical pixels)
+                // Cursor top-left position in physical pixels;
+                // macOS places the candidate window just below this area
                 let cursor_x = pr.x + col as f32 * cell_w;
-                let cursor_y = pr.y + (row as f32 + 1.0) * cell_h;
+                let cursor_y = pr.y + row as f32 * cell_h;
 
                 state.window.set_ime_cursor_area(
                     winit::dpi::PhysicalPosition::new(cursor_x as i32, cursor_y as i32),
