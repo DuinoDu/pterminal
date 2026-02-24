@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 
 use anyhow::Result;
 use portable_pty::{CommandBuilder, NativePtySystem, PtyPair, PtySize, PtySystem};
@@ -11,6 +11,8 @@ pub struct PtyHandle {
     master: Box<dyn portable_pty::MasterPty + Send>,
     reader_thread: Option<std::thread::JoinHandle<()>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Set to true when the reader thread exits (shell process ended)
+    exited: Arc<AtomicBool>,
 }
 
 impl PtyHandle {
@@ -47,6 +49,8 @@ impl PtyHandle {
         drop(pair.slave);
 
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_clone = exited.clone();
 
         // Spawn reader thread
         let mut reader = pair.master.try_clone_reader()?;
@@ -64,6 +68,7 @@ impl PtyHandle {
                         }
                     }
                 }
+                exited_clone.store(true, Ordering::Release);
             })?;
 
         Ok(Self {
@@ -71,6 +76,7 @@ impl PtyHandle {
             master: pair.master,
             reader_thread: Some(reader_thread),
             _child: child,
+            exited,
         })
     }
 
@@ -91,6 +97,11 @@ impl PtyHandle {
             pixel_height: 0,
         })?;
         Ok(())
+    }
+
+    /// Check if the shell process has exited
+    pub fn is_alive(&self) -> bool {
+        !self.exited.load(Ordering::Acquire)
     }
 }
 

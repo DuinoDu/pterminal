@@ -542,8 +542,10 @@ impl ApplicationHandler for AppHandler {
                     let tab_count = state.workspace_mgr.workspace_count();
                     if tab_count > 1 {
                         let tab_width = state.renderer.width() as f32 / tab_count as f32;
-                        let close_btn_w = 20.0 * scale;
-                        let clicked_tab = (phys_x / tab_width) as usize;
+                        // Close button zone matches renderer: font_size * 0.8 * 2.0
+                        let tab_font_size = state.renderer.text_renderer.font_size() * 0.8;
+                        let close_btn_w = tab_font_size * 2.0;
+                        let clicked_tab = (phys_x / tab_width).min(tab_count as f32 - 1.0) as usize;
                         let tab_right_edge = (clicked_tab + 1) as f32 * tab_width;
 
                         if phys_x > tab_right_edge - close_btn_w {
@@ -871,7 +873,7 @@ impl ApplicationHandler for AppHandler {
                 let tab_count = state.workspace_mgr.workspace_count();
                 let active_idx = state.workspace_mgr.active_index();
                 let tabs: Vec<(String, bool)> = (0..tab_count)
-                    .map(|i| (format!("Tab {}  ✕", i + 1), i == active_idx))
+                    .map(|i| (format!("Tab {}", i + 1), i == active_idx))
                     .collect();
                 let tab_bar_bg = RgbColor::new(0x1e, 0x1f, 0x29);
                 let tab_active_bg = theme.colors.background;
@@ -897,6 +899,41 @@ impl ApplicationHandler for AppHandler {
 
                 let layout = state.workspace_mgr.active_workspace().split_tree.layout();
                 let active_pane = state.workspace_mgr.active_workspace().active_pane();
+
+                // Check for dead panes (shell process exited)
+                let dead_panes: Vec<PaneId> = state
+                    .pane_states
+                    .iter()
+                    .filter(|(_, ps)| !ps.pty.is_alive())
+                    .map(|(id, _)| *id)
+                    .collect();
+                if !dead_panes.is_empty() {
+                    for pid in &dead_panes {
+                        state.pane_states.remove(pid);
+                        state.renderer.text_renderer.remove_pane(*pid);
+                    }
+                    // Close workspaces that contain dead panes
+                    let ws_ids: Vec<_> = state.workspace_mgr.workspaces().iter()
+                        .filter(|ws| ws.pane_ids().iter().any(|p| dead_panes.contains(p)))
+                        .map(|ws| ws.id)
+                        .collect();
+                    for ws_id in ws_ids {
+                        if state.workspace_mgr.workspace_count() > 1 {
+                            state.workspace_mgr.close_workspace(ws_id);
+                        } else {
+                            // Last tab — exit the app
+                            event_loop.exit();
+                            return;
+                        }
+                    }
+                    Self::update_title(state);
+                    for ps in state.pane_states.values() {
+                        ps.dirty.store(true, Ordering::Relaxed);
+                    }
+                    // Re-fetch layout after workspace changes
+                    state.window.request_redraw();
+                    return;
+                }
 
                 let mut pane_rects: Vec<(PaneId, PixelRect)> = Vec::with_capacity(layout.len());
                 let cursor_color = theme.colors.cursor;

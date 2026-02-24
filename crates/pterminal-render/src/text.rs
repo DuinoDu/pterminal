@@ -469,6 +469,10 @@ impl TextRenderer {
         (self.font_size * 0.6, self.line_height)
     }
 
+    pub fn font_size(&self) -> f32 {
+        self.font_size
+    }
+
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
     }
@@ -545,25 +549,42 @@ impl TextRenderer {
         }
 
         // Build per-tab text buffers, each positioned at its tab region
+        // Each tab has a label buffer (left) and a close button buffer (right)
         let metrics = Metrics::new(tab_font_size, tab_height);
         let default_attrs = Attrs::new().family(Family::Monospace);
-        let mut tab_buffers = Vec::with_capacity(tabs.len());
+        let close_btn_w = tab_font_size * 2.0; // width reserved for ✕
+        let mut tab_buffers = Vec::with_capacity(tabs.len() * 2);
 
         for (i, (label, active)) in tabs.iter().enumerate() {
-            let mut buffer = Buffer::new(&mut self.font_system, metrics);
-            buffer.set_size(&mut self.font_system, Some(tab_width), Some(tab_height));
+            let x_offset = i as f32 * tab_width;
             let color = if *active { active_fg } else { fg };
-            let text = format!(" {} ", label);
             let attrs = default_attrs.color(Color::rgb(color.r, color.g, color.b));
-            buffer.set_rich_text(
+
+            // Tab label (left-aligned)
+            let mut label_buf = Buffer::new(&mut self.font_system, metrics);
+            label_buf.set_size(&mut self.font_system, Some(tab_width - close_btn_w), Some(tab_height));
+            let label_text = format!("  {}", label);
+            label_buf.set_rich_text(
                 &mut self.font_system,
-                [(&text as &str, attrs)],
+                [(&label_text as &str, attrs)],
                 default_attrs,
                 Shaping::Advanced,
             );
-            buffer.shape_until_scroll(&mut self.font_system, false);
-            let x_offset = i as f32 * tab_width;
-            tab_buffers.push((buffer, x_offset));
+            label_buf.shape_until_scroll(&mut self.font_system, false);
+            tab_buffers.push((label_buf, x_offset));
+
+            // Close button ✕ (right side of tab)
+            let mut close_buf = Buffer::new(&mut self.font_system, metrics);
+            close_buf.set_size(&mut self.font_system, Some(close_btn_w), Some(tab_height));
+            let dim_color = default_attrs.color(Color::rgb(fg.r, fg.g, fg.b));
+            close_buf.set_rich_text(
+                &mut self.font_system,
+                [("✕", dim_color)],
+                default_attrs,
+                Shaping::Advanced,
+            );
+            close_buf.shape_until_scroll(&mut self.font_system, false);
+            tab_buffers.push((close_buf, x_offset + tab_width - close_btn_w));
         }
 
         self.tab_bar = Some(TabBar {
