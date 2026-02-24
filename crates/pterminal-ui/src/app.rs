@@ -118,8 +118,10 @@ impl AppHandler {
         let (cell_w, cell_h) = state.renderer.text_renderer.cell_size();
         let scale = state.scale_factor as f32;
         let padding = 6.0 * scale;
-        let px = state.last_mouse_pos.0 as f32 * scale - padding;
-        let py = state.last_mouse_pos.1 as f32 * scale - padding;
+        let tab_bar_h = state.renderer.text_renderer.tab_bar_height();
+        // last_mouse_pos is already in physical pixels (PhysicalPosition from winit)
+        let px = state.last_mouse_pos.0 as f32 - padding;
+        let py = state.last_mouse_pos.1 as f32 - padding - tab_bar_h;
         let col = (px / cell_w).max(0.0) as u16;
         let row = (py / cell_h).max(0.0) as u16;
 
@@ -441,8 +443,9 @@ impl ApplicationHandler for AppHandler {
             // Mouse events for selection
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Left, .. } => {
                 let scale = state.scale_factor as f32;
-                let phys_x = state.last_mouse_pos.0 as f32 * scale;
-                let phys_y = state.last_mouse_pos.1 as f32 * scale;
+                // last_mouse_pos is already physical pixels
+                let phys_x = state.last_mouse_pos.0 as f32;
+                let phys_y = state.last_mouse_pos.1 as f32;
 
                 // Check context menu click
                 if let Some(ref menu) = state.context_menu {
@@ -542,8 +545,8 @@ impl ApplicationHandler for AppHandler {
             WindowEvent::MouseInput { state: btn_state, button: MouseButton::Right, .. } => {
                 if btn_state == ElementState::Pressed {
                     let scale = state.scale_factor as f32;
-                    let phys_x = state.last_mouse_pos.0 as f32 * scale;
-                    let phys_y = state.last_mouse_pos.1 as f32 * scale;
+                    let phys_x = state.last_mouse_pos.0 as f32;
+                    let phys_y = state.last_mouse_pos.1 as f32;
                     let has_selection = state.selection.is_some();
                     let mut items = Vec::new();
                     if has_selection {
