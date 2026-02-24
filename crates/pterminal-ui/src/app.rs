@@ -832,6 +832,37 @@ impl ApplicationHandler for AppHandler {
                     }
                 }
 
+                // Ctrl+C with selection → copy; Ctrl+V → paste
+                let ctrl = state.modifiers.control_key();
+                if ctrl {
+                    if let Key::Character(ref c) = event.logical_key {
+                        match c.as_str() {
+                            "c" if state.selection.is_some() => {
+                                if let Some(text) =
+                                    Self::get_selected_text(state, &self.app.theme)
+                                {
+                                    if let Some(clip) = &mut state.clipboard {
+                                        let _ = clip.set_text(text);
+                                    }
+                                }
+                                return;
+                            }
+                            "v" => {
+                                if let Some(clip) = &mut state.clipboard {
+                                    if let Ok(text) = clip.get_text() {
+                                        let active = state.workspace_mgr.active_workspace().active_pane();
+                                        if let Some(ps) = state.pane_states.get(&active) {
+                                            let _ = ps.pty.write(text.as_bytes());
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 // Clear selection on any other key press
                 if state.selection.is_some() {
                     state.selection = None;
@@ -843,7 +874,6 @@ impl ApplicationHandler for AppHandler {
 
                 // Send keystrokes to the active pane's PTY
                 // Handle Ctrl+letter → control character (0x01..0x1A)
-                let ctrl = state.modifiers.control_key();
                 let bytes = if ctrl {
                     if let Key::Character(ref c) = event.logical_key {
                         let ch = c.as_str().as_bytes();
