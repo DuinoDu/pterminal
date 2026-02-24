@@ -861,8 +861,12 @@ impl ApplicationHandler for AppHandler {
                     }
                 }
 
-                // Clear selection on any other key press
-                if state.selection.is_some() {
+                // Clear selection on any other key press (but not modifier-only keys)
+                let is_modifier_only = matches!(
+                    event.logical_key,
+                    Key::Named(NamedKey::Control | NamedKey::Shift | NamedKey::Super | NamedKey::Alt)
+                );
+                if state.selection.is_some() && !is_modifier_only {
                     state.selection = None;
                     let active = state.workspace_mgr.active_workspace().active_pane();
                     if let Some(ps) = state.pane_states.get(&active) {
