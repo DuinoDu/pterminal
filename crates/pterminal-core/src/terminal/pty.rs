@@ -1,18 +1,27 @@
 use std::io::{Read, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
+use std::time::Duration;
 
 use anyhow::Result;
 use portable_pty::{CommandBuilder, NativePtySystem, PtyPair, PtySize, PtySystem};
 use tracing::{debug, error};
 
+use crate::terminal::emulator::TerminalEmulatorHandle;
+use crate::terminal::spsc;
+
+const INPUT_QUEUE_DEPTH: usize = 1024;
+const WRITER_IDLE_PARK_MS: u64 = 5;
+
 /// Handle to a running PTY process
 pub struct PtyHandle {
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    input_tx: Option<spsc::Producer<Vec<u8>>>,
+    writer_waker: std::thread::Thread,
     master: Box<dyn portable_pty::MasterPty + Send>,
     reader_thread: Option<std::thread::JoinHandle<()>>,
+    writer_thread: Option<std::thread::JoinHandle<()>>,
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Set to true when the reader thread exits (shell process ended)
     exited: Arc<AtomicBool>,
@@ -25,7 +34,8 @@ impl PtyHandle {
         working_dir: &std::path::Path,
         cols: u16,
         rows: u16,
-        on_output: impl Fn(&[u8]) + Send + 'static,
+        emulator: TerminalEmulatorHandle,
+        on_output_ready: impl Fn() + Send + 'static,
         on_exit: impl Fn() + Send + 'static,
     ) -> Result<Self> {
         let pty_system = NativePtySystem::default();
@@ -52,9 +62,35 @@ impl PtyHandle {
         // Drop slave — we only need the master side
         drop(pair.slave);
 
-        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let mut writer = pair.master.take_writer()?;
+        let (input_tx, input_rx) = spsc::channel::<Vec<u8>>(INPUT_QUEUE_DEPTH);
         let exited = Arc::new(AtomicBool::new(false));
         let exited_clone = exited.clone();
+
+        // Spawn dedicated writer thread so UI/input handling never blocks on PTY writes.
+        let writer_thread = std::thread::Builder::new()
+            .name("pty-writer".into())
+            .spawn(move || loop {
+                let mut did_work = false;
+                while let Some(chunk) = input_rx.try_pop() {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = writer.write_all(&chunk) {
+                        error!("PTY write error: {}", e);
+                        return;
+                    }
+                    did_work = true;
+                }
+
+                if !did_work {
+                    if input_rx.is_producer_closed() {
+                        return;
+                    }
+                    std::thread::park_timeout(Duration::from_millis(WRITER_IDLE_PARK_MS));
+                }
+            })?;
+        let writer_waker = writer_thread.thread().clone();
 
         // Spawn reader thread
         let mut reader = pair.master.try_clone_reader()?;
@@ -65,7 +101,10 @@ impl PtyHandle {
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
-                        Ok(n) => on_output(&buf[..n]),
+                        Ok(n) => {
+                            emulator.process(&buf[..n]);
+                            on_output_ready();
+                        }
                         Err(e) => {
                             error!("PTY read error: {}", e);
                             break;
@@ -77,19 +116,28 @@ impl PtyHandle {
             })?;
 
         Ok(Self {
-            writer,
+            input_tx: Some(input_tx),
+            writer_waker,
             master: pair.master,
             reader_thread: Some(reader_thread),
+            writer_thread: Some(writer_thread),
             _child: child,
             exited,
         })
     }
 
-    /// Write bytes to the PTY (keyboard input)
+    /// Queue bytes for PTY input without blocking on the PTY itself.
     pub fn write(&self, data: &[u8]) -> Result<()> {
-        let mut writer = self.writer.lock().unwrap();
-        writer.write_all(data)?;
-        writer.flush()?;
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        self.input_tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PTY input queue disconnected"))?
+            .push_blocking(data.to_vec())
+            .map_err(|_| anyhow::anyhow!("PTY input queue disconnected"))?;
+        self.writer_waker.unpark();
         Ok(())
     }
 
@@ -112,8 +160,13 @@ impl PtyHandle {
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
+        let _ = self.input_tx.take();
+        // Wake parked worker so it can observe queue closure and exit.
+        self.writer_waker.unpark();
         // Don't join the reader thread — it may be blocked on read().
         // Just detach it; it will exit when the PTY master fd is closed.
         let _ = self.reader_thread.take();
+        // Writer thread will exit once senders are dropped as part of teardown.
+        let _ = self.writer_thread.take();
     }
 }

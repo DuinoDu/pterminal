@@ -30,22 +30,31 @@ pub struct PixelRect {
 /// Per-line render buffer with change detection
 struct LineBuffer {
     buffer: Buffer,
-    content_hash: u64,
+    text_hash: u64,
+    bg_hash: u64,
+    is_blank: bool,
 }
 
 /// Per-pane collection of line buffers + background rects
 struct PaneBuffer {
     lines: Vec<LineBuffer>,
-    /// Background rects in cell-relative coords (col, row, color)
-    bg_cells: Vec<BgCell>,
+    /// Background spans from terminal content (cell-relative coords)
+    content_bg_spans: Vec<BgSpan>,
+    /// Selection highlight spans (cell-relative coords)
+    selection_bg_spans: Vec<BgSpan>,
     /// Cursor position and color for vertical bar rendering
     cursor: Option<(u16, u16, [f32; 4])>, // (col, row, color)
+    last_selection: Option<((u16, u16), (u16, u16))>,
+    last_selection_bg: RgbColor,
+    last_default_bg: RgbColor,
+    last_line_layout_key: Option<(u32, u32)>,
 }
 
-/// A cell that needs a non-default background
-struct BgCell {
+/// A horizontal run of cells sharing the same background color
+struct BgSpan {
     col: u16,
     row: u16,
+    width: u16,
     color: [f32; 4],
 }
 
@@ -67,10 +76,9 @@ pub struct TextRenderer {
     line_height: f32,
     /// Tab bar label buffer (None = no tab bar)
     tab_bar: Option<TabBar>,
-    /// Left sidebar (None = hidden)
-    sidebar: Option<SidebarPanel>,
     /// Context menu overlay (None = hidden)
     context_menu: Option<ContextMenuOverlay>,
+    atlas_trim_frames: u32,
 }
 
 /// Tab bar state
@@ -88,20 +96,6 @@ struct ContextMenuOverlay {
     x: f32,
     y: f32,
     w: f32,
-    h: f32,
-    bg_rects: Vec<crate::bg::BgRect>,
-}
-
-/// Sidebar panel (drawn in main layer)
-struct SidebarPanel {
-    rail_buffer: Buffer,
-    panel_buffer: Buffer,
-    rail_text_x: f32,
-    rail_text_y: f32,
-    panel_text_x: f32,
-    panel_text_y: f32,
-    rail_w: f32,
-    panel_w: f32,
     h: f32,
     bg_rects: Vec<crate::bg::BgRect>,
 }
@@ -150,8 +144,8 @@ impl TextRenderer {
             font_size: scaled_font_size,
             line_height: scaled_line_height,
             tab_bar: None,
-            sidebar: None,
             context_menu: None,
+            atlas_trim_frames: 0,
         }
     }
 
@@ -170,6 +164,7 @@ impl TextRenderer {
             for lb in &mut pb.lines {
                 lb.buffer.set_metrics(&mut self.font_system, metrics);
             }
+            pb.last_line_layout_key = None;
         }
     }
 
@@ -178,6 +173,7 @@ impl TextRenderer {
         &mut self,
         pane_id: PaneId,
         grid: &[GridLine],
+        dirty_rows: Option<&[usize]>,
         cursor_pos: (u16, u16),
         cursor_visible: bool,
         cursor_color: RgbColor,
@@ -191,65 +187,26 @@ impl TextRenderer {
             .entry(pane_id)
             .or_insert_with(|| PaneBuffer {
                 lines: Vec::new(),
-                bg_cells: Vec::new(),
+                content_bg_spans: Vec::new(),
+                selection_bg_spans: Vec::new(),
                 cursor: None,
+                last_selection: None,
+                last_selection_bg: RgbColor::new(0, 0, 0),
+                last_default_bg: RgbColor::new(0, 0, 0),
+                last_line_layout_key: None,
             });
 
         // Ensure correct number of line buffers
+        let line_count_changed = pb.lines.len() != grid.len();
         while pb.lines.len() < grid.len() {
             pb.lines.push(LineBuffer {
                 buffer: Buffer::new(&mut self.font_system, metrics),
-                content_hash: 0,
+                text_hash: u64::MAX,
+                bg_hash: u64::MAX,
+                is_blank: true,
             });
         }
         pb.lines.truncate(grid.len());
-
-        // Collect background cells (rebuilt every time content changes)
-        pb.bg_cells.clear();
-        for (row_idx, line) in grid.iter().enumerate() {
-            for (col_idx, cell) in line.cells.iter().enumerate() {
-                if cell.bg != default_bg {
-                    pb.bg_cells.push(BgCell {
-                        col: col_idx as u16,
-                        row: row_idx as u16,
-                        color: [
-                            cell.bg.r as f32 / 255.0,
-                            cell.bg.g as f32 / 255.0,
-                            cell.bg.b as f32 / 255.0,
-                            1.0,
-                        ],
-                    });
-                }
-            }
-        }
-
-        // Selection highlight bg cells
-        if let Some((start, end)) = selection {
-            let sel_color = [
-                selection_bg.r as f32 / 255.0,
-                selection_bg.g as f32 / 255.0,
-                selection_bg.b as f32 / 255.0,
-                1.0,
-            ];
-            for row in start.1..=end.1 {
-                if row as usize >= grid.len() {
-                    break;
-                }
-                let col_start = if row == start.1 { start.0 } else { 0 };
-                let col_end = if row == end.1 {
-                    end.0 + 1
-                } else {
-                    grid[row as usize].cells.len() as u16
-                };
-                for col in col_start..col_end {
-                    pb.bg_cells.push(BgCell {
-                        col,
-                        row,
-                        color: sel_color,
-                    });
-                }
-            }
-        }
 
         // Store cursor for vertical bar rendering in collect_bg_rects
         let (cursor_col, cursor_row) = cursor_pos;
@@ -269,40 +226,55 @@ impl TextRenderer {
         }
 
         let default_attrs = Attrs::new().family(Family::Monospace);
-
-        for (row_idx, line) in grid.iter().enumerate() {
-            let hash = hash_line(line);
-            if hash == pb.lines[row_idx].content_hash {
-                continue;
+        let mut content_bg_dirty = line_count_changed || pb.last_default_bg != default_bg;
+        if line_count_changed {
+            for (row_idx, line) in grid.iter().enumerate() {
+                update_line_buffer(
+                    &mut self.font_system,
+                    pb,
+                    row_idx,
+                    line,
+                    default_attrs,
+                    &mut content_bg_dirty,
+                );
             }
-            pb.lines[row_idx].content_hash = hash;
+        } else if let Some(dirty_rows) = dirty_rows {
+            for &row_idx in dirty_rows {
+                if let Some(line) = grid.get(row_idx) {
+                    update_line_buffer(
+                        &mut self.font_system,
+                        pb,
+                        row_idx,
+                        line,
+                        default_attrs,
+                        &mut content_bg_dirty,
+                    );
+                }
+            }
+        } else {
+            for (row_idx, line) in grid.iter().enumerate() {
+                update_line_buffer(
+                    &mut self.font_system,
+                    pb,
+                    row_idx,
+                    line,
+                    default_attrs,
+                    &mut content_bg_dirty,
+                );
+            }
+        }
 
-            let (text, spans) = build_line_rich_text(line);
-            let rich: Vec<(&str, Attrs)> = spans
-                .iter()
-                .map(|span| {
-                    let slice = &text[span.start..span.end];
-                    let mut attrs =
-                        default_attrs.color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
-                    if span.bold {
-                        attrs = attrs.weight(Weight::BOLD);
-                    }
-                    if span.italic {
-                        attrs = attrs.style(Style::Italic);
-                    }
-                    (slice, attrs)
-                })
-                .collect();
+        if content_bg_dirty {
+            rebuild_content_bg_spans(&mut pb.content_bg_spans, grid, default_bg);
+            pb.last_default_bg = default_bg;
+        }
 
-            pb.lines[row_idx].buffer.set_rich_text(
-                &mut self.font_system,
-                rich,
-                default_attrs,
-                Shaping::Advanced,
-            );
-            pb.lines[row_idx]
-                .buffer
-                .shape_until_scroll(&mut self.font_system, false);
+        let selection_dirty =
+            pb.last_selection != selection || pb.last_selection_bg != selection_bg;
+        if selection_dirty {
+            rebuild_selection_bg_spans(&mut pb.selection_bg_spans, grid, selection, selection_bg);
+            pb.last_selection = selection;
+            pb.last_selection_bg = selection_bg;
         }
     }
 
@@ -324,13 +296,23 @@ impl TextRenderer {
             height: self.height,
         };
         self.viewport.update(queue, resolution);
+        let no_wrap_slack = (self.font_size * 0.6 * 2.0).max(2.0);
 
-        // Set width on each line buffer
+        // Set width on each line buffer only when pane width / line height changed.
         for (pane_id, rect) in panes {
             if let Some(pb) = self.pane_buffers.get_mut(pane_id) {
-                for lb in &mut pb.lines {
-                    lb.buffer
-                        .set_size(&mut self.font_system, Some(rect.w), Some(self.line_height));
+                let layout_key = Some((rect.w.to_bits(), self.line_height.to_bits()));
+                if pb.last_line_layout_key != layout_key {
+                    for lb in &mut pb.lines {
+                        lb.buffer.set_size(
+                            &mut self.font_system,
+                            // Add a small slack so terminal rows don't soft-wrap due to
+                            // glyph advance rounding differences vs our cell width estimate.
+                            Some(rect.w + no_wrap_slack),
+                            Some(self.line_height),
+                        );
+                    }
+                    pb.last_line_layout_key = layout_key;
                 }
             }
         }
@@ -360,42 +342,13 @@ impl TextRenderer {
             }
         }
 
-        // Sidebar text
-        if let Some(ref sb) = self.sidebar {
-            text_areas.push(TextArea {
-                buffer: &sb.rail_buffer,
-                left: sb.rail_text_x,
-                top: sb.rail_text_y,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: sb.rail_text_x as i32,
-                    top: sb.rail_text_y as i32,
-                    right: (sb.rail_text_x + sb.rail_w) as i32,
-                    bottom: (sb.rail_text_y + sb.h) as i32,
-                },
-                default_color: default_glyphon_color,
-                custom_glyphs: &[],
-            });
-            text_areas.push(TextArea {
-                buffer: &sb.panel_buffer,
-                left: sb.panel_text_x,
-                top: sb.panel_text_y,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: sb.panel_text_x as i32,
-                    top: sb.panel_text_y as i32,
-                    right: (sb.panel_text_x + sb.panel_w) as i32,
-                    bottom: (sb.panel_text_y + sb.h) as i32,
-                },
-                default_color: default_glyphon_color,
-                custom_glyphs: &[],
-            });
-        }
-
         // Pane text
         for (pane_id, rect) in panes {
             if let Some(pb) = self.pane_buffers.get(pane_id) {
                 for (idx, lb) in pb.lines.iter().enumerate() {
+                    if lb.is_blank {
+                        continue;
+                    }
                     text_areas.push(TextArea {
                         buffer: &lb.buffer,
                         left: rect.x,
@@ -470,7 +423,12 @@ impl TextRenderer {
     }
 
     pub fn post_render(&mut self) {
-        self.atlas.trim();
+        self.atlas_trim_frames = self.atlas_trim_frames.wrapping_add(1);
+        // Trimming every frame causes avoidable CPU work and glyph churn.
+        if self.atlas_trim_frames >= 120 {
+            self.atlas.trim();
+            self.atlas_trim_frames = 0;
+        }
     }
 
     /// Collect background rects for all visible panes (physical pixel coords)
@@ -478,24 +436,36 @@ impl TextRenderer {
         let cell_w = self.font_size * 0.6;
         let cell_h = self.line_height;
         let cursor_bar_w = 2.0 * self.scale_factor;
-        let mut rects = Vec::new();
+        let mut total_rects = self.tab_bar.as_ref().map_or(0, |tb| tb.bg_rects.len());
+        for (pane_id, _) in panes {
+            if let Some(pb) = self.pane_buffers.get(pane_id) {
+                total_rects += pb.content_bg_spans.len();
+                total_rects += pb.selection_bg_spans.len();
+                total_rects += usize::from(pb.cursor.is_some());
+            }
+        }
+        let mut rects = Vec::with_capacity(total_rects);
 
         // Tab bar bg rects
         if let Some(ref tb) = self.tab_bar {
             rects.extend_from_slice(&tb.bg_rects);
         }
-        // Sidebar bg rects
-        if let Some(ref sb) = self.sidebar {
-            rects.extend_from_slice(&sb.bg_rects);
-        }
-
         for (pane_id, rect) in panes {
             if let Some(pb) = self.pane_buffers.get(pane_id) {
-                for bg in &pb.bg_cells {
+                for bg in &pb.content_bg_spans {
                     rects.push(crate::bg::BgRect {
                         x: rect.x + bg.col as f32 * cell_w,
                         y: rect.y + bg.row as f32 * cell_h,
-                        w: cell_w,
+                        w: bg.width as f32 * cell_w,
+                        h: cell_h,
+                        color: bg.color,
+                    });
+                }
+                for bg in &pb.selection_bg_spans {
+                    rects.push(crate::bg::BgRect {
+                        x: rect.x + bg.col as f32 * cell_w,
+                        y: rect.y + bg.row as f32 * cell_h,
+                        w: bg.width as f32 * cell_w,
                         h: cell_h,
                         color: bg.color,
                     });
@@ -540,13 +510,6 @@ impl TextRenderer {
     /// Returns tab bar height in physical pixels (0 if no tab bar)
     pub fn tab_bar_height(&self) -> f32 {
         self.tab_bar.as_ref().map_or(0.0, |tb| tb.height)
-    }
-
-    /// Returns sidebar width in physical pixels (0 if hidden)
-    pub fn sidebar_width(&self) -> f32 {
-        self.sidebar
-            .as_ref()
-            .map_or(0.0, |sb| sb.rail_w + sb.panel_w)
     }
 
     /// Update tab bar content. Pass empty slice to hide.
@@ -668,148 +631,6 @@ impl TextRenderer {
         });
     }
 
-    /// Update left sidebar content.
-    pub fn set_sidebar(
-        &mut self,
-        rail_width: f32,
-        panel_width: f32,
-        rail_lines: &[String],
-        panel_lines: &[String],
-        session_count: usize,
-        active_session_idx: usize,
-        rail_bg: RgbColor,
-        panel_bg: RgbColor,
-        fg: RgbColor,
-    ) {
-        if rail_width <= 0.0 && panel_width <= 0.0 {
-            self.sidebar = None;
-            return;
-        }
-
-        let tab_h = self.tab_bar_height();
-        let panel_h = (self.height as f32 - tab_h).max(1.0);
-        let scale = self.scale_factor;
-        let pad = 8.0 * scale;
-        let border_w = 1.0 * scale;
-
-        let total_w = rail_width + panel_width;
-        let mut bg_rects = Vec::with_capacity(3);
-        bg_rects.push(crate::bg::BgRect {
-            x: 0.0,
-            y: tab_h,
-            w: rail_width,
-            h: panel_h,
-            color: [
-                rail_bg.r as f32 / 255.0,
-                rail_bg.g as f32 / 255.0,
-                rail_bg.b as f32 / 255.0,
-                1.0,
-            ],
-        });
-        bg_rects.push(crate::bg::BgRect {
-            x: rail_width,
-            y: tab_h,
-            w: panel_width,
-            h: panel_h,
-            color: [
-                panel_bg.r as f32 / 255.0,
-                panel_bg.g as f32 / 255.0,
-                panel_bg.b as f32 / 255.0,
-                1.0,
-            ],
-        });
-        bg_rects.push(crate::bg::BgRect {
-            x: (total_w - border_w).max(0.0),
-            y: tab_h,
-            w: border_w,
-            h: panel_h,
-            color: [0.32, 0.33, 0.38, 1.0],
-        });
-        if panel_width > 0.0 {
-            let card_x = rail_width + 8.0 * scale;
-            let card_w = (panel_width - 16.0 * scale).max(1.0);
-            let card_h = 52.0 * scale;
-            let card_gap = 8.0 * scale;
-            let mut card_y = tab_h + 10.0 * scale;
-            for i in 0..session_count {
-                let color = if i == active_session_idx {
-                    [0.09, 0.47, 0.91, 1.0]
-                } else {
-                    [0.16, 0.18, 0.23, 1.0]
-                };
-                bg_rects.push(crate::bg::BgRect {
-                    x: card_x,
-                    y: card_y,
-                    w: card_w,
-                    h: card_h,
-                    color,
-                });
-                card_y += card_h + card_gap;
-            }
-        }
-
-        let panel_font_size = self.font_size * 0.78;
-        let panel_line_h = self.line_height * 0.95;
-        let panel_metrics = Metrics::new(panel_font_size, panel_line_h);
-        let mut panel_buffer = Buffer::new(&mut self.font_system, panel_metrics);
-        let panel_text_w = (panel_width - pad * 2.0).max(1.0);
-        let panel_text_h = (panel_h - pad * 2.0).max(1.0);
-        panel_buffer.set_size(
-            &mut self.font_system,
-            Some(panel_text_w),
-            Some(panel_text_h),
-        );
-
-        let panel_text = if panel_lines.is_empty() {
-            String::new()
-        } else {
-            panel_lines.join("\n")
-        };
-
-        let rail_font_size = self.font_size * 0.88;
-        let rail_line_h = self.line_height * 1.1;
-        let rail_metrics = Metrics::new(rail_font_size, rail_line_h);
-        let mut rail_buffer = Buffer::new(&mut self.font_system, rail_metrics);
-        let rail_text_w = (rail_width - pad * 1.2).max(1.0);
-        let rail_text_h = (panel_h - pad * 2.0).max(1.0);
-        rail_buffer.set_size(&mut self.font_system, Some(rail_text_w), Some(rail_text_h));
-        let rail_text = if rail_lines.is_empty() {
-            String::new()
-        } else {
-            rail_lines.join("\n")
-        };
-
-        let default_attrs = Attrs::new().family(Family::Monospace);
-        let attrs = default_attrs.color(Color::rgb(fg.r, fg.g, fg.b));
-        panel_buffer.set_rich_text(
-            &mut self.font_system,
-            [(&panel_text as &str, attrs)],
-            default_attrs,
-            Shaping::Advanced,
-        );
-        panel_buffer.shape_until_scroll(&mut self.font_system, false);
-        rail_buffer.set_rich_text(
-            &mut self.font_system,
-            [(&rail_text as &str, attrs)],
-            default_attrs,
-            Shaping::Advanced,
-        );
-        rail_buffer.shape_until_scroll(&mut self.font_system, false);
-
-        self.sidebar = Some(SidebarPanel {
-            rail_buffer,
-            panel_buffer,
-            rail_text_x: pad * 0.6,
-            rail_text_y: tab_h + pad,
-            panel_text_x: rail_width + pad,
-            panel_text_y: tab_h + pad,
-            rail_w: rail_width,
-            panel_w: panel_width,
-            h: panel_h,
-            bg_rects,
-        });
-    }
-
     /// Show context menu at given position with given items
     pub fn set_context_menu(
         &mut self,
@@ -911,7 +732,153 @@ impl TextRenderer {
         self.context_menu = None;
     }
 }
-fn hash_line(line: &GridLine) -> u64 {
+
+fn update_line_buffer(
+    font_system: &mut FontSystem,
+    pb: &mut PaneBuffer,
+    row_idx: usize,
+    line: &GridLine,
+    default_attrs: Attrs<'static>,
+    content_bg_dirty: &mut bool,
+) {
+    let lb = &mut pb.lines[row_idx];
+
+    let bg_hash = hash_line_bg(line);
+    if bg_hash != lb.bg_hash {
+        lb.bg_hash = bg_hash;
+        *content_bg_dirty = true;
+    }
+
+    let text_hash = hash_line_text(line);
+    if text_hash == lb.text_hash {
+        return;
+    }
+    lb.text_hash = text_hash;
+
+    if line_is_visually_blank(line) {
+        lb.is_blank = true;
+        return;
+    }
+
+    lb.is_blank = false;
+    let (text, spans) = build_line_rich_text(line);
+    let shaping = if line_is_basic_shaping_friendly(line, &spans) {
+        Shaping::Basic
+    } else {
+        Shaping::Advanced
+    };
+
+    if spans.len() == 1 {
+        let span = &spans[0];
+        let mut attrs = default_attrs.color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
+        if span.bold {
+            attrs = attrs.weight(Weight::BOLD);
+        }
+        if span.italic {
+            attrs = attrs.style(Style::Italic);
+        }
+        let slice = &text[span.start..span.end];
+        lb.buffer
+            .set_rich_text(font_system, [(slice, attrs)], default_attrs, shaping);
+    } else {
+        let rich: Vec<(&str, Attrs)> = spans
+            .iter()
+            .map(|span| {
+                let slice = &text[span.start..span.end];
+                let mut attrs = default_attrs.color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
+                if span.bold {
+                    attrs = attrs.weight(Weight::BOLD);
+                }
+                if span.italic {
+                    attrs = attrs.style(Style::Italic);
+                }
+                (slice, attrs)
+            })
+            .collect();
+        lb.buffer
+            .set_rich_text(font_system, rich, default_attrs, shaping);
+    }
+    lb.buffer.shape_until_scroll(font_system, false);
+}
+
+fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
+    [
+        color.r as f32 / 255.0,
+        color.g as f32 / 255.0,
+        color.b as f32 / 255.0,
+        1.0,
+    ]
+}
+
+fn rebuild_content_bg_spans(out: &mut Vec<BgSpan>, grid: &[GridLine], default_bg: RgbColor) {
+    out.clear();
+    for (row_idx, line) in grid.iter().enumerate() {
+        let mut col = 0usize;
+        while col < line.cells.len() {
+            let cell_bg = line.cells[col].bg;
+            if cell_bg == default_bg {
+                col += 1;
+                continue;
+            }
+
+            let mut end = col + 1;
+            while end < line.cells.len() && line.cells[end].bg == cell_bg {
+                end += 1;
+            }
+
+            out.push(BgSpan {
+                col: col as u16,
+                row: row_idx as u16,
+                width: (end - col) as u16,
+                color: rgb_to_rgba(cell_bg),
+            });
+            col = end;
+        }
+    }
+}
+
+fn rebuild_selection_bg_spans(
+    out: &mut Vec<BgSpan>,
+    grid: &[GridLine],
+    selection: Option<((u16, u16), (u16, u16))>,
+    selection_bg: RgbColor,
+) {
+    out.clear();
+    let Some((start, end)) = selection else {
+        return;
+    };
+
+    let color = rgb_to_rgba(selection_bg);
+    for row in start.1..=end.1 {
+        let Some(line) = grid.get(row as usize) else {
+            break;
+        };
+
+        let col_start = if row == start.1 { start.0 } else { 0 };
+        let col_end = if row == end.1 {
+            end.0.saturating_add(1)
+        } else {
+            line.cells.len() as u16
+        };
+        if col_end <= col_start {
+            continue;
+        }
+
+        let clamped_end = col_end.min(line.cells.len() as u16);
+        if clamped_end <= col_start {
+            continue;
+        }
+
+        out.push(BgSpan {
+            col: col_start,
+            row,
+            width: clamped_end - col_start,
+            color,
+        });
+    }
+}
+
+fn hash_line_text(line: &GridLine) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for cell in line.cells.iter() {
@@ -922,6 +889,37 @@ fn hash_line(line: &GridLine) -> u64 {
         cell.bold.hash(&mut hasher);
         cell.italic.hash(&mut hasher);
         cell.wide_spacer.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn line_is_visually_blank(line: &GridLine) -> bool {
+    line.cells
+        .iter()
+        .all(|cell| cell.wide_spacer || cell.c == '\0' || cell.c == ' ')
+}
+
+fn line_is_basic_shaping_friendly(line: &GridLine, spans: &[RichSpan]) -> bool {
+    if spans.len() > 1 {
+        return false;
+    }
+    line.cells
+        .iter()
+        .filter(|cell| !cell.wide_spacer)
+        .all(|cell| {
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            ch.is_ascii()
+        })
+}
+
+fn hash_line_bg(line: &GridLine) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    line.cells.len().hash(&mut hasher);
+    for cell in line.cells.iter() {
+        cell.bg.r.hash(&mut hasher);
+        cell.bg.g.hash(&mut hasher);
+        cell.bg.b.hash(&mut hasher);
     }
     hasher.finish()
 }

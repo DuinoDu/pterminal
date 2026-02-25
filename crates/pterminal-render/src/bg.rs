@@ -24,11 +24,14 @@ pub struct BgRenderer {
     capacity: usize,
     screen_uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    vertex_scratch: Vec<BgVertex>,
+    last_screen_size: (u32, u32),
 }
 
 impl BgRenderer {
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
@@ -119,7 +122,29 @@ impl BgRenderer {
             cache: None,
         });
 
-        let capacity = 4096; // max rects
+        let capacity = 4096; // initial rect capacity (grows on demand)
+        let (vertex_buffer, index_buffer) = Self::create_geometry_buffers(device, capacity);
+
+        let mut renderer = Self {
+            pipeline,
+            vertex_buffer,
+            index_buffer,
+            num_indices: 0,
+            capacity,
+            screen_uniform,
+            bind_group,
+            vertex_scratch: Vec::with_capacity(capacity * 4),
+            last_screen_size: (0, 0),
+        };
+        renderer.upload_index_buffer(queue);
+        renderer.update_screen_size(queue, width, height);
+        renderer
+    }
+
+    fn create_geometry_buffers(
+        device: &wgpu::Device,
+        capacity: usize,
+    ) -> (wgpu::Buffer, wgpu::Buffer) {
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bg_vertex"),
             size: (capacity * 4 * std::mem::size_of::<BgVertex>()) as u64,
@@ -132,66 +157,99 @@ impl BgRenderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        let mut renderer = Self {
-            pipeline,
-            vertex_buffer,
-            index_buffer,
-            num_indices: 0,
-            capacity,
-            screen_uniform,
-            bind_group,
-        };
-        renderer.update_screen_size(device, width, height);
-        renderer
+        (vertex_buffer, index_buffer)
     }
 
-    fn update_screen_size(&mut self, _device: &wgpu::Device, _width: u32, _height: u32) {
-        // Updated via queue.write_buffer in prepare()
-    }
-
-    /// Upload background rects to GPU
-    pub fn prepare(&mut self, queue: &wgpu::Queue, rects: &[BgRect], screen_w: u32, screen_h: u32) {
+    fn update_screen_size(&mut self, queue: &wgpu::Queue, width: u32, height: u32) {
+        if self.last_screen_size == (width, height) {
+            return;
+        }
+        self.last_screen_size = (width, height);
         queue.write_buffer(
             &self.screen_uniform,
             0,
-            bytemuck::cast_slice(&[screen_w as f32, screen_h as f32]),
+            bytemuck::cast_slice(&[width as f32, height as f32]),
         );
+    }
+
+    fn upload_index_buffer(&mut self, queue: &wgpu::Queue) {
+        let mut indices: Vec<u32> = Vec::with_capacity(self.capacity * 6);
+        for i in 0..self.capacity {
+            let base = (i * 4) as u32;
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
+    }
+
+    fn ensure_capacity(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed: usize) {
+        if needed <= self.capacity {
+            return;
+        }
+
+        let new_capacity = needed
+            .next_power_of_two()
+            .max(self.capacity.saturating_mul(2));
+        let (vertex_buffer, index_buffer) = Self::create_geometry_buffers(device, new_capacity);
+        self.vertex_buffer = vertex_buffer;
+        self.index_buffer = index_buffer;
+        self.capacity = new_capacity;
+        self.upload_index_buffer(queue);
+        if self.vertex_scratch.capacity() < new_capacity * 4 {
+            let additional = new_capacity * 4 - self.vertex_scratch.capacity();
+            self.vertex_scratch.reserve(additional);
+        }
+    }
+
+    /// Upload background rects to GPU
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rects: &[BgRect],
+        screen_w: u32,
+        screen_h: u32,
+    ) {
+        self.update_screen_size(queue, screen_w, screen_h);
 
         if rects.is_empty() {
             self.num_indices = 0;
             return;
         }
 
-        let count = rects.len().min(self.capacity);
-        let mut vertices: Vec<BgVertex> = Vec::with_capacity(count * 4);
-        let mut indices: Vec<u32> = Vec::with_capacity(count * 6);
+        self.ensure_capacity(device, queue, rects.len());
 
-        for (i, rect) in rects.iter().take(count).enumerate() {
-            let base = (i * 4) as u32;
+        self.vertex_scratch.clear();
+        if self.vertex_scratch.capacity() < rects.len() * 4 {
+            let additional = rects.len() * 4 - self.vertex_scratch.capacity();
+            self.vertex_scratch.reserve(additional);
+        }
+
+        for rect in rects.iter() {
             let (x0, y0, x1, y1) = (rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
-            vertices.push(BgVertex {
+            self.vertex_scratch.push(BgVertex {
                 position: [x0, y0],
                 color: rect.color,
             });
-            vertices.push(BgVertex {
+            self.vertex_scratch.push(BgVertex {
                 position: [x1, y0],
                 color: rect.color,
             });
-            vertices.push(BgVertex {
+            self.vertex_scratch.push(BgVertex {
                 position: [x1, y1],
                 color: rect.color,
             });
-            vertices.push(BgVertex {
+            self.vertex_scratch.push(BgVertex {
                 position: [x0, y1],
                 color: rect.color,
             });
-            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
 
-        queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
-        self.num_indices = indices.len() as u32;
+        queue.write_buffer(
+            &self.vertex_buffer,
+            0,
+            bytemuck::cast_slice(&self.vertex_scratch),
+        );
+        self.num_indices = (rects.len() * 6) as u32;
     }
 
     /// Render background rects

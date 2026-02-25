@@ -34,7 +34,7 @@ impl Renderer {
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
@@ -97,8 +97,8 @@ impl Renderer {
             font_size,
         );
 
-        let bg_renderer = BgRenderer::new(&device, surface_format, width, height);
-        let overlay_bg_renderer = BgRenderer::new(&device, surface_format, width, height);
+        let bg_renderer = BgRenderer::new(&device, &queue, surface_format, width, height);
+        let overlay_bg_renderer = BgRenderer::new(&device, &queue, surface_format, width, height);
 
         Ok(Self {
             device,

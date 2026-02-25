@@ -17,7 +17,6 @@ pub struct Config {
     pub window: WindowConfig,
     pub scrollback: ScrollbackConfig,
     pub cursor: CursorConfig,
-    pub sidebar: SidebarConfig,
     pub notification: NotificationConfig,
     pub tmux: TmuxConfig,
     pub keybindings: std::collections::HashMap<String, String>,
@@ -68,16 +67,6 @@ pub struct CursorConfig {
     pub style: String,
     pub blink: bool,
     pub blink_interval_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SidebarConfig {
-    pub width: u32,
-    pub show_git_branch: bool,
-    pub show_cwd: bool,
-    pub show_ports: bool,
-    pub show_notification_badge: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,7 +147,6 @@ impl Default for Config {
             window: WindowConfig::default(),
             scrollback: ScrollbackConfig::default(),
             cursor: CursorConfig::default(),
-            sidebar: SidebarConfig::default(),
             notification: NotificationConfig::default(),
             tmux: TmuxConfig::default(),
             keybindings: default_keybindings(),
@@ -221,18 +209,6 @@ impl Default for CursorConfig {
             style: "block".to_string(),
             blink: true,
             blink_interval_ms: 530,
-        }
-    }
-}
-
-impl Default for SidebarConfig {
-    fn default() -> Self {
-        Self {
-            width: 220,
-            show_git_branch: true,
-            show_cwd: true,
-            show_ports: true,
-            show_notification_badge: true,
         }
     }
 }
