@@ -86,3 +86,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[patch.crates-io]
+cosmic-text = { path = "vendor/cosmic-text" }
