@@ -59,7 +59,7 @@ struct PaneState {
 /// Main application state
 pub struct App {
     config: Config,
-    theme: Theme,
+    theme: Arc<Theme>,
     state: Option<RunningState>,
 }
 
@@ -123,7 +123,7 @@ impl App {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            theme: Theme::default(),
+            theme: Arc::new(Theme::default()),
             state: None,
         }
     }
@@ -213,7 +213,7 @@ impl AppHandler {
     }
 
     /// Extract selected text from the active pane's grid
-    fn get_selected_text(state: &RunningState, theme: &Theme) -> Option<String> {
+    fn get_selected_text(state: &RunningState, theme: &Arc<Theme>) -> Option<String> {
         let sel = state.selection?;
         let (start, end) = sel.normalized();
 
@@ -344,7 +344,7 @@ impl AppHandler {
     }
 
     /// Find the word boundaries around a cell position
-    fn word_selection_at(state: &RunningState, theme: &Theme, col: u16, row: u16) -> Selection {
+    fn word_selection_at(state: &RunningState, theme: &Arc<Theme>, col: u16, row: u16) -> Selection {
         let active_pane = state.workspace_mgr.active_workspace().active_pane();
         if let Some(ps) = state.pane_states.get(&active_pane) {
             let grid = ps.emulator.extract_grid(theme);
@@ -569,7 +569,7 @@ impl AppHandler {
     fn handle_ipc_requests(
         state: &mut RunningState,
         config: &Config,
-        theme: &Theme,
+        theme: &Arc<Theme>,
         event_loop: &ActiveEventLoop,
     ) {
         while let Ok(msg) = state.ipc_rx.try_recv() {
@@ -581,7 +581,7 @@ impl AppHandler {
     fn handle_ipc_request(
         state: &mut RunningState,
         config: &Config,
-        theme: &Theme,
+        theme: &Arc<Theme>,
         event_loop: &ActiveEventLoop,
         request: JsonRpcRequest,
     ) -> JsonRpcResponse {

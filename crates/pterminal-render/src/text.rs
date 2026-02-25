@@ -48,6 +48,9 @@ struct PaneBuffer {
     last_selection_bg: RgbColor,
     last_default_bg: RgbColor,
     last_line_layout_key: Option<(u32, u32)>,
+    /// Reusable scratch buffers to avoid per-line allocation
+    scratch_text: String,
+    scratch_spans: Vec<RichSpan>,
 }
 
 /// A horizontal run of cells sharing the same background color
@@ -194,6 +197,8 @@ impl TextRenderer {
                 last_selection_bg: RgbColor::new(0, 0, 0),
                 last_default_bg: RgbColor::new(0, 0, 0),
                 last_line_layout_key: None,
+                scratch_text: String::with_capacity(256),
+                scratch_spans: Vec::with_capacity(16),
             });
 
         // Ensure correct number of line buffers
@@ -226,7 +231,9 @@ impl TextRenderer {
         }
 
         let default_attrs = Attrs::new().family(Family::Monospace);
-        let mut content_bg_dirty = line_count_changed || pb.last_default_bg != default_bg;
+        let bg_full_rebuild = line_count_changed || pb.last_default_bg != default_bg;
+        let mut bg_dirty_rows: Vec<usize> = Vec::new();
+        let mut any_bg_dirty = bg_full_rebuild;
         if line_count_changed {
             for (row_idx, line) in grid.iter().enumerate() {
                 update_line_buffer(
@@ -235,7 +242,8 @@ impl TextRenderer {
                     row_idx,
                     line,
                     default_attrs,
-                    &mut content_bg_dirty,
+                    &mut any_bg_dirty,
+                    &mut bg_dirty_rows,
                 );
             }
         } else if let Some(dirty_rows) = dirty_rows {
@@ -247,7 +255,8 @@ impl TextRenderer {
                         row_idx,
                         line,
                         default_attrs,
-                        &mut content_bg_dirty,
+                        &mut any_bg_dirty,
+                        &mut bg_dirty_rows,
                     );
                 }
             }
@@ -259,13 +268,25 @@ impl TextRenderer {
                     row_idx,
                     line,
                     default_attrs,
-                    &mut content_bg_dirty,
+                    &mut any_bg_dirty,
+                    &mut bg_dirty_rows,
                 );
             }
         }
 
-        if content_bg_dirty {
-            rebuild_content_bg_spans(&mut pb.content_bg_spans, grid, default_bg);
+        if any_bg_dirty {
+            if bg_full_rebuild || bg_dirty_rows.len() > grid.len() / 2 {
+                // Full rebuild when > half the rows changed or grid resized.
+                rebuild_content_bg_spans(&mut pb.content_bg_spans, grid, default_bg);
+            } else {
+                // Incremental: only update spans for dirty rows.
+                incremental_update_bg_spans(
+                    &mut pb.content_bg_spans,
+                    grid,
+                    default_bg,
+                    &bg_dirty_rows,
+                );
+            }
             pb.last_default_bg = default_bg;
         }
 
@@ -739,35 +760,44 @@ fn update_line_buffer(
     row_idx: usize,
     line: &GridLine,
     default_attrs: Attrs<'static>,
-    content_bg_dirty: &mut bool,
+    any_bg_dirty: &mut bool,
+    bg_dirty_rows: &mut Vec<usize>,
 ) {
     let lb = &mut pb.lines[row_idx];
 
-    let bg_hash = hash_line_bg(line);
+    // Single pass over cells for both text and bg hashes.
+    let (text_hash, bg_hash) = hash_line_combined(line);
     if bg_hash != lb.bg_hash {
         lb.bg_hash = bg_hash;
-        *content_bg_dirty = true;
+        *any_bg_dirty = true;
+        bg_dirty_rows.push(row_idx);
     }
 
-    let text_hash = hash_line_text(line);
     if text_hash == lb.text_hash {
         return;
     }
     lb.text_hash = text_hash;
 
-    if line_is_visually_blank(line) {
-        lb.is_blank = true;
+    // Reuse pane-level scratch buffers to avoid per-line allocation.
+    // build_line_rich_text_into also reports blank/ASCII status to avoid extra passes.
+    let text = &mut pb.scratch_text;
+    let spans = &mut pb.scratch_spans;
+    let line_info = build_line_rich_text_into(line, text, spans);
+
+    if line_info.is_blank {
+        pb.lines[row_idx].is_blank = true;
         return;
     }
 
-    lb.is_blank = false;
-    let (text, spans) = build_line_rich_text(line);
-    let shaping = if line_is_basic_shaping_friendly(line, &spans) {
+    let shaping = if line_info.all_ascii {
         Shaping::Basic
     } else {
         Shaping::Advanced
     };
 
+    // Re-borrow lb after scratch buffer usage (scratch lives on pb).
+    let lb = &mut pb.lines[row_idx];
+    lb.is_blank = false;
     if spans.len() == 1 {
         let span = &spans[0];
         let mut attrs = default_attrs.color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
@@ -813,27 +843,48 @@ fn rgb_to_rgba(color: RgbColor) -> [f32; 4] {
 fn rebuild_content_bg_spans(out: &mut Vec<BgSpan>, grid: &[GridLine], default_bg: RgbColor) {
     out.clear();
     for (row_idx, line) in grid.iter().enumerate() {
-        let mut col = 0usize;
-        while col < line.cells.len() {
-            let cell_bg = line.cells[col].bg;
-            if cell_bg == default_bg {
-                col += 1;
-                continue;
-            }
+        emit_bg_spans_for_row(out, line, row_idx, default_bg);
+    }
+}
 
-            let mut end = col + 1;
-            while end < line.cells.len() && line.cells[end].bg == cell_bg {
-                end += 1;
-            }
-
-            out.push(BgSpan {
-                col: col as u16,
-                row: row_idx as u16,
-                width: (end - col) as u16,
-                color: rgb_to_rgba(cell_bg),
-            });
-            col = end;
+/// Incrementally update bg spans for a subset of dirty rows.
+fn incremental_update_bg_spans(
+    out: &mut Vec<BgSpan>,
+    grid: &[GridLine],
+    default_bg: RgbColor,
+    dirty_rows: &[usize],
+) {
+    // Remove old spans for dirty rows.
+    out.retain(|span| !dirty_rows.contains(&(span.row as usize)));
+    // Add new spans for dirty rows.
+    for &row_idx in dirty_rows {
+        if let Some(line) = grid.get(row_idx) {
+            emit_bg_spans_for_row(out, line, row_idx, default_bg);
         }
+    }
+}
+
+fn emit_bg_spans_for_row(out: &mut Vec<BgSpan>, line: &GridLine, row_idx: usize, default_bg: RgbColor) {
+    let mut col = 0usize;
+    while col < line.cells.len() {
+        let cell_bg = line.cells[col].bg;
+        if cell_bg == default_bg {
+            col += 1;
+            continue;
+        }
+
+        let mut end = col + 1;
+        while end < line.cells.len() && line.cells[end].bg == cell_bg {
+            end += 1;
+        }
+
+        out.push(BgSpan {
+            col: col as u16,
+            row: row_idx as u16,
+            width: (end - col) as u16,
+            color: rgb_to_rgba(cell_bg),
+        });
+        col = end;
     }
 }
 
@@ -878,69 +929,65 @@ fn rebuild_selection_bg_spans(
     }
 }
 
-fn hash_line_text(line: &GridLine) -> u64 {
+/// Compute text hash and bg hash in a single pass over cells.
+fn hash_line_combined(line: &GridLine) -> (u64, u64) {
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut text_h = ahash::AHasher::default();
+    let mut bg_h = ahash::AHasher::default();
+    line.cells.len().hash(&mut bg_h);
     for cell in line.cells.iter() {
-        cell.c.hash(&mut hasher);
-        cell.fg.r.hash(&mut hasher);
-        cell.fg.g.hash(&mut hasher);
-        cell.fg.b.hash(&mut hasher);
-        cell.bold.hash(&mut hasher);
-        cell.italic.hash(&mut hasher);
-        cell.wide_spacer.hash(&mut hasher);
+        cell.c.hash(&mut text_h);
+        cell.fg.r.hash(&mut text_h);
+        cell.fg.g.hash(&mut text_h);
+        cell.fg.b.hash(&mut text_h);
+        cell.bold.hash(&mut text_h);
+        cell.italic.hash(&mut text_h);
+        cell.wide_spacer.hash(&mut text_h);
+        cell.bg.r.hash(&mut bg_h);
+        cell.bg.g.hash(&mut bg_h);
+        cell.bg.b.hash(&mut bg_h);
     }
-    hasher.finish()
+    (text_h.finish(), bg_h.finish())
 }
 
-fn line_is_visually_blank(line: &GridLine) -> bool {
-    line.cells
-        .iter()
-        .all(|cell| cell.wide_spacer || cell.c == '\0' || cell.c == ' ')
+/// Info produced by build_line_rich_text_into alongside the text/spans.
+struct LineInfo {
+    is_blank: bool,
+    all_ascii: bool,
 }
 
-fn line_is_basic_shaping_friendly(line: &GridLine, spans: &[RichSpan]) -> bool {
-    if spans.len() > 1 {
-        return false;
-    }
-    line.cells
-        .iter()
-        .filter(|cell| !cell.wide_spacer)
-        .all(|cell| {
-            let ch = if cell.c == '\0' { ' ' } else { cell.c };
-            ch.is_ascii()
-        })
-}
-
-fn hash_line_bg(line: &GridLine) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    line.cells.len().hash(&mut hasher);
-    for cell in line.cells.iter() {
-        cell.bg.r.hash(&mut hasher);
-        cell.bg.g.hash(&mut hasher);
-        cell.bg.b.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
-/// Build rich text spans for a single terminal line
-fn build_line_rich_text(line: &GridLine) -> (String, Vec<RichSpan>) {
-    let mut text = String::with_capacity(line.cells.len());
-    let mut spans: Vec<RichSpan> = Vec::with_capacity(8);
+/// Build rich text spans into caller-provided scratch buffers.
+/// Also detects blank lines and ASCII-only content in the same pass
+/// (replaces separate line_is_visually_blank and line_is_basic_shaping_friendly calls).
+fn build_line_rich_text_into(
+    line: &GridLine,
+    text: &mut String,
+    spans: &mut Vec<RichSpan>,
+) -> LineInfo {
+    text.clear();
+    spans.clear();
 
     let mut cur_fg = RgbColor::new(255, 255, 255);
     let mut cur_bold = false;
     let mut cur_italic = false;
     let mut span_start = 0;
+    let mut all_ascii = true;
+    let mut is_blank = true;
 
-    for (_col, cell) in line.cells.iter().enumerate() {
-        // Skip spacer cells for wide (CJK) characters
+    for cell in line.cells.iter() {
         if cell.wide_spacer {
             continue;
         }
 
         let ch = if cell.c == '\0' { ' ' } else { cell.c };
+
+        if is_blank && ch != ' ' {
+            is_blank = false;
+        }
+        if all_ascii && !ch.is_ascii() {
+            all_ascii = false;
+        }
+
         let fg = cell.fg;
         let bold = cell.bold;
         let italic = cell.italic;
@@ -975,5 +1022,5 @@ fn build_line_rich_text(line: &GridLine) -> (String, Vec<RichSpan>) {
         });
     }
 
-    (text, spans)
+    LineInfo { is_blank, all_ascii }
 }

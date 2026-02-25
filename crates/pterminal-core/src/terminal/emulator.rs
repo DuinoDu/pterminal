@@ -1,4 +1,5 @@
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener};
@@ -71,11 +72,11 @@ enum ControlCommand {
     QueryCursor(Sender<(u16, u16)>),
     QueryDisplayOffset(Sender<usize>),
     ExtractFull {
-        theme: Theme,
+        theme: Arc<Theme>,
         reply: Sender<Vec<GridLine>>,
     },
     ExtractDelta {
-        theme: Theme,
+        theme: Arc<Theme>,
         reply: Sender<DeltaExtractReply>,
     },
     Shutdown,
@@ -226,13 +227,13 @@ impl TerminalEmulator {
     }
 
     /// Extract terminal grid content for rendering (respects display_offset for scrollback)
-    pub fn extract_grid(&self, theme: &Theme) -> Vec<GridLine> {
+    pub fn extract_grid(&self, theme: &Arc<Theme>) -> Vec<GridLine> {
         let (tx, rx) = mpsc::channel();
         if send_control_blocking(
             &self.control_tx,
             &self.parser_waker,
             ControlCommand::ExtractFull {
-                theme: theme.clone(),
+                theme: Arc::clone(theme),
                 reply: tx,
             },
         )
@@ -246,7 +247,7 @@ impl TerminalEmulator {
     /// Incrementally update a cached grid snapshot using alacritty's damage tracking.
     ///
     /// This updates `out` in place and returns which viewport rows changed.
-    pub fn extract_grid_delta_into(&self, theme: &Theme, out: &mut Vec<GridLine>) -> GridDelta {
+    pub fn extract_grid_delta_into(&self, theme: &Arc<Theme>, out: &mut Vec<GridLine>) -> GridDelta {
         self.extract_grid_delta_with_cursor_into(theme, out).0
     }
 
@@ -254,7 +255,7 @@ impl TerminalEmulator {
     /// from the same parser-thread snapshot to avoid an extra roundtrip.
     pub fn extract_grid_delta_with_cursor_into(
         &self,
-        theme: &Theme,
+        theme: &Arc<Theme>,
         out: &mut Vec<GridLine>,
     ) -> (GridDelta, (u16, u16)) {
         let (tx, rx) = mpsc::channel();
@@ -262,7 +263,7 @@ impl TerminalEmulator {
             &self.control_tx,
             &self.parser_waker,
             ControlCommand::ExtractDelta {
-                theme: theme.clone(),
+                theme: Arc::clone(theme),
                 reply: tx,
             },
         )
@@ -488,10 +489,12 @@ fn extract_grid_delta_from_term(
     let grid = term.grid();
 
     if delta.full {
-        out.clear();
-        out.reserve(num_lines);
+        // Resize line count but reuse existing cell Vec capacity.
+        out.resize_with(num_lines, || GridLine { cells: Vec::with_capacity(num_cols) });
+        out.truncate(num_lines);
         for line_idx in 0..num_lines {
-            let mut cells = Vec::with_capacity(num_cols);
+            let cells = &mut out[line_idx].cells;
+            cells.clear();
             let actual_line = line_idx as i32 - display_offset as i32;
             for col_idx in 0..num_cols {
                 let point =
@@ -511,7 +514,6 @@ fn extract_grid_delta_from_term(
                     wide_spacer: flags.contains(Flags::WIDE_CHAR_SPACER),
                 });
             }
-            out.push(GridLine { cells });
         }
         delta.dirty_rows.extend(0..num_lines);
     } else {
@@ -520,13 +522,8 @@ fn extract_grid_delta_from_term(
                 continue;
             }
 
-            let line = &mut out[line_idx];
-            if line.cells.len() != num_cols {
-                line.cells.clear();
-                line.cells.reserve(num_cols);
-            } else {
-                line.cells.clear();
-            }
+            let cells = &mut out[line_idx].cells;
+            cells.clear();
 
             let actual_line = line_idx as i32 - display_offset as i32;
             for col_idx in 0..num_cols {
@@ -537,7 +534,7 @@ fn extract_grid_delta_from_term(
                 let bg = alacritty_color_to_rgb(&cell.bg, theme);
                 let flags = cell.flags;
 
-                line.cells.push(GridCell {
+                cells.push(GridCell {
                     c: cell.c,
                     fg,
                     bg,

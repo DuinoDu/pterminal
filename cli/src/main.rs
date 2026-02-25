@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
@@ -152,7 +153,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_bench(cols: u16, rows: u16, iterations: usize) -> Result<()> {
-    let theme = Theme::default();
+    let theme = Arc::new(Theme::default());
 
     let throughput = bench_throughput_ls_like(&theme, cols, rows, iterations);
     let scrollback = bench_scrollback(&theme, cols, rows, iterations);
@@ -179,7 +180,7 @@ async fn run_bench(cols: u16, rows: u16, iterations: usize) -> Result<()> {
     Ok(())
 }
 
-fn bench_throughput_ls_like(theme: &Theme, cols: u16, rows: u16, iterations: usize) -> Value {
+fn bench_throughput_ls_like(theme: &Arc<Theme>, cols: u16, rows: u16, iterations: usize) -> Value {
     let emu = TerminalEmulator::new(cols, rows);
     let mut snapshot = Vec::new();
     let mut total_bytes = 0usize;
@@ -206,7 +207,7 @@ fn bench_throughput_ls_like(theme: &Theme, cols: u16, rows: u16, iterations: usi
     )
 }
 
-fn bench_scrollback(theme: &Theme, cols: u16, rows: u16, iterations: usize) -> Value {
+fn bench_scrollback(theme: &Arc<Theme>, cols: u16, rows: u16, iterations: usize) -> Value {
     let emu = TerminalEmulator::new(cols, rows);
     let mut snapshot = Vec::new();
     let mut total_bytes = 0usize;
@@ -233,7 +234,7 @@ fn bench_scrollback(theme: &Theme, cols: u16, rows: u16, iterations: usize) -> V
     )
 }
 
-fn bench_clear_screen_ctrl_l(theme: &Theme, cols: u16, rows: u16, iterations: usize) -> Value {
+fn bench_clear_screen_ctrl_l(theme: &Arc<Theme>, cols: u16, rows: u16, iterations: usize) -> Value {
     let emu = TerminalEmulator::new(cols, rows);
     let mut snapshot = Vec::new();
     // Prime with enough content so clear-screen does real work.
@@ -264,7 +265,7 @@ fn bench_clear_screen_ctrl_l(theme: &Theme, cols: u16, rows: u16, iterations: us
     )
 }
 
-fn bench_selection_drag(theme: &Theme, cols: u16, rows: u16, iterations: usize) -> Value {
+fn bench_selection_drag(theme: &Arc<Theme>, cols: u16, rows: u16, iterations: usize) -> Value {
     let emu = TerminalEmulator::new(cols, rows);
     let mut snapshot = Vec::new();
     // Prime with a full screen of content.
@@ -302,7 +303,7 @@ fn bench_selection_drag(theme: &Theme, cols: u16, rows: u16, iterations: usize) 
     })
 }
 
-fn bench_split_scene(theme: &Theme, cols: u16, rows: u16, iterations: usize) -> Value {
+fn bench_split_scene(theme: &Arc<Theme>, cols: u16, rows: u16, iterations: usize) -> Value {
     let pane_count = 4usize;
     let mut panes: Vec<(TerminalEmulator, Vec<GridLine>)> = (0..pane_count)
         .map(|_| (TerminalEmulator::new(cols / 2, rows / 2), Vec::new()))
@@ -339,7 +340,7 @@ fn bench_split_scene(theme: &Theme, cols: u16, rows: u16, iterations: usize) -> 
 }
 
 async fn bench_render_pipeline(
-    theme: &Theme,
+    theme: &Arc<Theme>,
     cols: u16,
     rows: u16,
     iterations: usize,
