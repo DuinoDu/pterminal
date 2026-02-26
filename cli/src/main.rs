@@ -348,7 +348,7 @@ async fn bench_render_pipeline(
     let iterations = iterations.max(1);
     let pane_id: PaneId = 1;
 
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()
     });
@@ -358,8 +358,7 @@ async fn bench_render_pipeline(
             compatible_surface: None,
             force_fallback_adapter: false,
         })
-        .await
-        .ok_or_else(|| anyhow!("No suitable GPU adapter found for bench"))?;
+        .await?;
 
     let (device, queue) = adapter
         .request_device(
@@ -367,7 +366,6 @@ async fn bench_render_pipeline(
                 label: Some("pterminal-cli-bench"),
                 ..Default::default()
             },
-            None,
         )
         .await?;
 
@@ -473,10 +471,12 @@ async fn bench_render_pipeline(
                         load: wgpu::LoadOp::Clear(bg),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             bg_renderer.render(&mut pass);
             text_renderer.render(&mut pass);

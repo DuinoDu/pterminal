@@ -1,0 +1,264 @@
+// pterminal main UI — Slint-based chrome around wgpu terminal viewport
+
+// ── Data models ──────────────────────────────────────────────────────
+struct TabInfo {
+    title: string,
+    active: bool,
+}
+
+struct SidebarItem {
+    title: string,
+    active: bool,
+    index: int,
+}
+
+// ── Tab bar ──────────────────────────────────────────────────────────
+component Tab inherits Rectangle {
+    in property <string> title;
+    in property <bool> active;
+    in property <int> idx;
+    callback clicked(int);
+    callback close-clicked(int);
+
+    height: 32px;
+    min-width: 120px;
+    background: active ? #272935 : #1e1f29;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 4px;
+        spacing: 4px;
+        alignment: center;
+
+        Text {
+            text: title;
+            color: active ? #eff0ea : #888888;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        // Close button
+        Rectangle {
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+            background: close-hover.has-hover ? #ffffff20 : transparent;
+
+            Text {
+                text: "✕";
+                color: active ? #888888 : #555555;
+                font-size: 10px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            close-hover := TouchArea {
+                clicked => { close-clicked(idx); }
+            }
+        }
+    }
+
+    TouchArea {
+        clicked => { root.clicked(idx); }
+    }
+}
+
+component TabBar inherits Rectangle {
+    in property <[TabInfo]> tabs;
+    callback tab-clicked(int);
+    callback tab-close-clicked(int);
+    callback new-tab-clicked();
+
+    height: 32px;
+    background: #1e1f29;
+
+    HorizontalLayout {
+        spacing: 0px;
+        alignment: start;
+
+        for tab[idx] in tabs: Tab {
+            title: tab.title;
+            active: tab.active;
+            idx: idx;
+            clicked(i) => { tab-clicked(i); }
+            close-clicked(i) => { tab-close-clicked(i); }
+        }
+
+        // New tab button
+        Rectangle {
+            width: 32px;
+            height: 32px;
+            background: new-tab-hover.has-hover ? #ffffff10 : transparent;
+
+            Text {
+                text: "+";
+                color: #888888;
+                font-size: 16px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            new-tab-hover := TouchArea {
+                clicked => { new-tab-clicked(); }
+            }
+        }
+    }
+}
+
+// ── Sidebar ──────────────────────────────────────────────────────────
+component SidebarEntry inherits Rectangle {
+    in property <string> title;
+    in property <bool> active;
+    in property <int> idx;
+    callback clicked(int);
+
+    height: 36px;
+    background: active ? #272935 : transparent;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        alignment: start;
+
+        // Active indicator bar
+        Rectangle {
+            width: 3px;
+            height: parent.height;
+            background: active ? #5294e2 : transparent;
+            border-radius: 1.5px;
+        }
+
+        Text {
+            text: title;
+            color: active ? #eff0ea : #888888;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+
+    TouchArea {
+        clicked => { root.clicked(idx); }
+    }
+}
+
+component Sidebar inherits Rectangle {
+    in property <[SidebarItem]> items;
+    in property <bool> expanded: true;
+    callback item-clicked(int);
+
+    width: expanded ? 180px : 0px;
+    background: #1a1b26;
+
+    VerticalLayout {
+        padding-top: 8px;
+        spacing: 2px;
+
+        Text {
+            text: "Workspaces";
+            color: #555555;
+            font-size: 10px;
+            horizontal-alignment: center;
+        }
+
+        for item[idx] in items: SidebarEntry {
+            title: item.title;
+            active: item.active;
+            idx: item.index;
+            clicked(i) => { item-clicked(i); }
+        }
+    }
+}
+
+// ── Main window ──────────────────────────────────────────────────────
+export component AppWindow inherits Window {
+    title: "pterminal";
+    preferred-width: 960px;
+    preferred-height: 640px;
+    background: #272935;
+
+    // ── Properties for Rust ↔ Slint binding ──
+    in-out property <[TabInfo]> tabs: [{ title: "Tab 1", active: true }];
+    in-out property <[SidebarItem]> sidebar-items: [];
+    in-out property <bool> sidebar-visible: false;
+    in-out property <image> terminal-texture;
+
+    // Terminal viewport geometry (physical pixels, reported to Rust)
+    out property <length> terminal-x: sidebar.width;
+    out property <length> terminal-y: tabs.length > 1 ? 32px : 0px;
+    out property <length> terminal-width: root.width - sidebar.width;
+    out property <length> terminal-height: root.height - (tabs.length > 1 ? 32px : 0px);
+
+    // ── Callbacks from UI → Rust ──
+    callback tab-clicked(int);
+    callback tab-close-clicked(int);
+    callback new-tab-clicked();
+    callback sidebar-item-clicked(int);
+    callback terminal-key-pressed(KeyEvent) -> EventResult;
+    callback terminal-pointer-event(PointerEvent, length /* x */, length /* y */);
+    callback terminal-pointer-move(length /* x */, length /* y */);
+    callback terminal-scroll(length /* delta-x */, length /* delta-y */);
+
+    // Give terminal keyboard focus on startup
+    public function focus-terminal() {
+        terminal-focus.focus();
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+
+        if root.tabs.length > 1: tab-bar := TabBar {
+            tabs: root.tabs;
+            tab-clicked(i) => { root.tab-clicked(i); }
+            tab-close-clicked(i) => { root.tab-close-clicked(i); }
+            new-tab-clicked => { root.new-tab-clicked(); }
+        }
+
+        HorizontalLayout {
+            spacing: 0px;
+
+            sidebar := Sidebar {
+                items: root.sidebar-items;
+                expanded: root.sidebar-visible;
+                item-clicked(i) => { root.sidebar-item-clicked(i); }
+            }
+
+            // Terminal viewport — displays offscreen wgpu texture
+            Rectangle {
+                background: #272935;
+
+                Image {
+                    source: root.terminal-texture;
+                    width: parent.width;
+                    height: parent.height;
+                    image-fit: fill;
+                }
+
+                // Keyboard focus scope — captures all keys for terminal
+                terminal-focus := FocusScope {
+                    key-pressed(event) => {
+                        return root.terminal-key-pressed(event);
+                    }
+                }
+
+                // Mouse handling for terminal area
+                terminal-touch := TouchArea {
+                    mouse-cursor: text;
+
+                    pointer-event(event) => {
+                        root.terminal-pointer-event(event, self.mouse-x, self.mouse-y);
+                    }
+
+                    moved => {
+                        root.terminal-pointer-move(self.mouse-x, self.mouse-y);
+                    }
+
+                    scroll-event(event) => {
+                        root.terminal-scroll(event.delta-x, event.delta-y);
+                        return accept;
+                    }
+                }
+            }
+        }
+    }
+}

@@ -21,11 +21,11 @@ alacritty_terminal = "0.25"
 portable-pty = "0.8"
 
 # GPU rendering
-wgpu = "23"
+wgpu = "28"
 winit = "0.30"
-glyphon = "0.7"
-cosmic-text = "0.12"
-fontdb = "0.16"
+glyphon = "0.10"
+cosmic-text = "0.15"
+fontdb = "0.22"
 pollster = "0.4"
 
 # Async / IPC
@@ -86,6 +86,3 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-
-[patch.crates-io]
-cosmic-text = { path = "vendor/cosmic-text" }

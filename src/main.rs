@@ -3,7 +3,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use pterminal_core::Config;
-use pterminal_ui::App;
+use pterminal_ui::SlintApp;
 
 fn main() -> Result<()> {
     // Initialize logging
@@ -21,7 +21,7 @@ fn main() -> Result<()> {
         Config::default()
     });
 
-    // Run the application
-    let app = App::new(config);
+    // Run the Slint-based application
+    let app = SlintApp::new(config);
     app.run()
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
+    fontdb, Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer as GlyphonTextRenderer, Viewport,
     Weight,
 };
@@ -241,7 +241,7 @@ impl TextRenderer {
                     pb,
                     row_idx,
                     line,
-                    default_attrs,
+                    &default_attrs,
                     &mut any_bg_dirty,
                     &mut bg_dirty_rows,
                 );
@@ -254,7 +254,7 @@ impl TextRenderer {
                         pb,
                         row_idx,
                         line,
-                        default_attrs,
+                        &default_attrs,
                         &mut any_bg_dirty,
                         &mut bg_dirty_rows,
                     );
@@ -267,7 +267,7 @@ impl TextRenderer {
                     pb,
                     row_idx,
                     line,
-                    default_attrs,
+                    &default_attrs,
                     &mut any_bg_dirty,
                     &mut bg_dirty_rows,
                 );
@@ -609,7 +609,7 @@ impl TextRenderer {
         for (i, (label, active)) in tabs.iter().enumerate() {
             let x_offset = i as f32 * tab_width;
             let color = if *active { active_fg } else { fg };
-            let attrs = default_attrs.color(Color::rgb(color.r, color.g, color.b));
+            let attrs = default_attrs.clone().color(Color::rgb(color.r, color.g, color.b));
 
             // Tab label (left-aligned)
             let mut label_buf = Buffer::new(&mut self.font_system, metrics);
@@ -622,8 +622,9 @@ impl TextRenderer {
             label_buf.set_rich_text(
                 &mut self.font_system,
                 [(&label_text as &str, attrs)],
-                default_attrs,
+                &default_attrs,
                 Shaping::Advanced,
+                None,
             );
             label_buf.shape_until_scroll(&mut self.font_system, false);
             tab_buffers.push((label_buf, x_offset));
@@ -633,12 +634,13 @@ impl TextRenderer {
             let close_metrics = Metrics::new(close_font_size, tab_height);
             let mut close_buf = Buffer::new(&mut self.font_system, close_metrics);
             close_buf.set_size(&mut self.font_system, Some(close_btn_w), Some(tab_height));
-            let dim_color = default_attrs.color(Color::rgb(fg.r, fg.g, fg.b));
+            let dim_color = default_attrs.clone().color(Color::rgb(fg.r, fg.g, fg.b));
             close_buf.set_rich_text(
                 &mut self.font_system,
                 [(" ✕", dim_color)],
-                default_attrs,
+                &default_attrs,
                 Shaping::Advanced,
+                None,
             );
             close_buf.shape_until_scroll(&mut self.font_system, false);
             tab_buffers.push((close_buf, x_offset + tab_width - close_btn_w));
@@ -728,13 +730,14 @@ impl TextRenderer {
         let fg_color = Color::rgb(0xee, 0xee, 0xee);
         let rich: Vec<(&str, Attrs)> = spans
             .iter()
-            .map(|(s, e)| (&text[*s..*e], default_attrs.color(fg_color)))
+            .map(|(s, e)| (&text[*s..*e], default_attrs.clone().color(fg_color)))
             .collect();
         buffer.set_rich_text(
             &mut self.font_system,
             rich,
-            default_attrs,
+            &default_attrs,
             Shaping::Advanced,
+            None,
         );
         buffer.shape_until_scroll(&mut self.font_system, false);
 
@@ -759,7 +762,7 @@ fn update_line_buffer(
     pb: &mut PaneBuffer,
     row_idx: usize,
     line: &GridLine,
-    default_attrs: Attrs<'static>,
+    default_attrs: &Attrs<'static>,
     any_bg_dirty: &mut bool,
     bg_dirty_rows: &mut Vec<usize>,
 ) {
@@ -800,7 +803,7 @@ fn update_line_buffer(
     lb.is_blank = false;
     if spans.len() == 1 {
         let span = &spans[0];
-        let mut attrs = default_attrs.color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
+        let mut attrs = default_attrs.clone().color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
         if span.bold {
             attrs = attrs.weight(Weight::BOLD);
         }
@@ -809,13 +812,13 @@ fn update_line_buffer(
         }
         let slice = &text[span.start..span.end];
         lb.buffer
-            .set_rich_text(font_system, [(slice, attrs)], default_attrs, shaping);
+            .set_rich_text(font_system, [(slice, attrs)], default_attrs, shaping, None);
     } else {
         let rich: Vec<(&str, Attrs)> = spans
             .iter()
             .map(|span| {
                 let slice = &text[span.start..span.end];
-                let mut attrs = default_attrs.color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
+                let mut attrs = default_attrs.clone().color(Color::rgb(span.fg.r, span.fg.g, span.fg.b));
                 if span.bold {
                     attrs = attrs.weight(Weight::BOLD);
                 }
@@ -826,7 +829,7 @@ fn update_line_buffer(
             })
             .collect();
         lb.buffer
-            .set_rich_text(font_system, rich, default_attrs, shaping);
+            .set_rich_text(font_system, rich, default_attrs, shaping, None);
     }
     lb.buffer.shape_until_scroll(font_system, false);
 }

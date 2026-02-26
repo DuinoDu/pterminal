@@ -25,7 +25,7 @@ impl Renderer {
         scale_factor: f64,
         font_size: f32,
     ) -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
@@ -38,8 +38,7 @@ impl Renderer {
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No suitable GPU adapter found"))?;
+            .await?;
 
         let (device, queue) = adapter
             .request_device(
@@ -47,7 +46,6 @@ impl Renderer {
                     label: Some("pterminal"),
                     ..Default::default()
                 },
-                None,
             )
             .await?;
 
@@ -167,10 +165,12 @@ impl Renderer {
                         }),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             // Background colors first, then text, then overlay (menu bg + menu text) on top
@@ -193,5 +193,127 @@ impl Renderer {
 
     pub fn height(&self) -> u32 {
         self.surface_config.height
+    }
+}
+
+/// Offscreen renderer: uses an external device/queue (e.g. from Slint)
+/// and renders the terminal scene to a wgpu::Texture instead of a surface.
+pub struct OffscreenRenderer {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub text_renderer: TextRenderer,
+    pub bg_renderer: BgRenderer,
+    pub overlay_bg_renderer: BgRenderer,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+}
+
+impl OffscreenRenderer {
+    /// Create from an existing device/queue (shared with Slint).
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        width: u32,
+        height: u32,
+        scale_factor: f64,
+        font_size: f32,
+    ) -> Self {
+        // Slint requires Rgba8Unorm for Image::try_from(Texture)
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+
+        let text_renderer =
+            TextRenderer::new(&device, &queue, format, width, height, scale_factor, font_size);
+        let bg_renderer = BgRenderer::new(&device, &queue, format, width, height);
+        let overlay_bg_renderer = BgRenderer::new(&device, &queue, format, width, height);
+
+        Self {
+            device,
+            queue,
+            text_renderer,
+            bg_renderer,
+            overlay_bg_renderer,
+            width,
+            height,
+            format,
+        }
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width > 0 && height > 0 {
+            self.width = width;
+            self.height = height;
+            self.text_renderer.resize(&self.queue, width, height);
+        }
+    }
+
+    /// Render the terminal scene to a new wgpu::Texture and return it.
+    /// The texture has RENDER_ATTACHMENT | TEXTURE_BINDING usage (required by Slint).
+    pub fn render_to_texture(&mut self, bg_color: RgbColor) -> wgpu::Texture {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen_terminal"),
+            size: wgpu::Extent3d {
+                width: self.width.max(1),
+                height: self.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("offscreen_encoder"),
+            });
+
+        {
+            let bg = bg_color.to_wgpu_color();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("offscreen_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: bg[0] as f64,
+                            g: bg[1] as f64,
+                            b: bg[2] as f64,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            self.bg_renderer.render(&mut pass);
+            self.text_renderer.render(&mut pass);
+            self.overlay_bg_renderer.render(&mut pass);
+            self.text_renderer.render_overlay(&mut pass);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.text_renderer.post_render();
+
+        texture
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
     }
 }

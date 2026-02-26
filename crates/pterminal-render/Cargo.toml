@@ -7,8 +7,6 @@ edition.workspace = true
 pterminal-core.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
-cosmic-text.workspace = true
-fontdb.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 bytemuck = { version = "1", features = ["derive"] }

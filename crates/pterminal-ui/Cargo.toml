@@ -2,6 +2,7 @@
 name = "pterminal-ui"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [dependencies]
 pterminal-core.workspace = true
@@ -14,3 +15,7 @@ tracing.workspace = true
 anyhow.workspace = true
 arboard.workspace = true
 serde_json.workspace = true
+slint = { version = "1.15", features = ["unstable-wgpu-28"] }
+
+[build-dependencies]
+slint-build = "1.15"
