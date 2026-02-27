@@ -1,4 +1,5 @@
 pub mod app;
+pub mod plugin;
 pub mod slint_app;
 
 pub use app::App;

@@ -23,6 +23,8 @@ use pterminal_ipc::{IpcServer, JsonRpcRequest, JsonRpcResponse};
 use pterminal_render::text::PixelRect;
 use pterminal_render::{BgRect, OffscreenRenderer};
 
+use crate::plugin::ContributionRegistry;
+
 slint::include_modules!();
 
 // Re-import generated/private types needed in callback signatures
@@ -150,6 +152,7 @@ struct IpcEnvelope {
 struct TerminalState {
     renderer: Option<OffscreenRenderer>,
     workspace_mgr: WorkspaceManager,
+    contributions: ContributionRegistry,
     pane_states: HashMap<PaneId, PaneState>,
     config: Config,
     theme: Arc<Theme>,
@@ -201,6 +204,11 @@ impl SlintApp {
         // 3. Shared state
         let theme = Arc::new(Theme::default());
         let workspace_mgr = WorkspaceManager::new();
+        let mut contributions = ContributionRegistry::new();
+        contributions.set_builtin_workspace_sidebar(
+            workspace_mgr.workspace_count(),
+            workspace_mgr.active_index(),
+        );
         let clipboard = Clipboard::new().ok();
 
         let (ipc_tx, ipc_rx) = mpsc::channel::<IpcEnvelope>();
@@ -240,6 +248,7 @@ impl SlintApp {
         let state = Rc::new(RefCell::new(TerminalState {
             renderer: None,
             workspace_mgr,
+            contributions,
             pane_states: HashMap::new(),
             config: self.config.clone(),
             theme: theme.clone(),
@@ -358,7 +367,7 @@ impl SlintApp {
                 for ps in s.pane_states.values() {
                     ps.dirty.store(true, Ordering::Relaxed);
                 }
-                update_tabs(&s, &app_weak2);
+                update_tabs(&mut s, &app_weak2);
             });
         }
         {
@@ -383,7 +392,7 @@ impl SlintApp {
                 for ps in s.pane_states.values() {
                     ps.dirty.store(true, Ordering::Relaxed);
                 }
-                update_tabs(&s, &app_weak2);
+                update_tabs(&mut s, &app_weak2);
             });
         }
         {
@@ -399,7 +408,7 @@ impl SlintApp {
                 };
                 let ps = spawn_pane_slint(&s.config, pane_id, cols, rows);
                 s.pane_states.insert(pane_id, ps);
-                update_tabs(&s, &app_weak2);
+                update_tabs(&mut s, &app_weak2);
             });
         }
 
@@ -409,11 +418,24 @@ impl SlintApp {
             let app_weak2 = app_weak.clone();
             app.on_sidebar_item_clicked(move |idx| {
                 let mut s = state.borrow_mut();
-                s.workspace_mgr.select_workspace(idx as usize);
+                if let Some(view_id) = s
+                    .contributions
+                    .sidebar_id_at(idx as usize)
+                    .map(ToOwned::to_owned)
+                {
+                    if let Some(workspace_idx) =
+                        ContributionRegistry::builtin_workspace_index(&view_id)
+                    {
+                        if workspace_idx < s.workspace_mgr.workspace_count() {
+                            s.workspace_mgr.select_workspace(workspace_idx);
+                            s.contributions.set_active_sidebar(view_id);
+                        }
+                    }
+                }
                 for ps in s.pane_states.values() {
                     ps.dirty.store(true, Ordering::Relaxed);
                 }
-                update_tabs(&s, &app_weak2);
+                update_tabs(&mut s, &app_weak2);
             });
         }
 
@@ -596,7 +618,7 @@ impl SlintApp {
         }
 
         // 10. Initial tab bar state
-        update_tabs(&state.borrow(), &app_weak);
+        update_tabs(&mut state.borrow_mut(), &app_weak);
 
         // 11. Customize macOS titlebar to blend with terminal background
         #[cfg(target_os = "macos")]
@@ -632,7 +654,7 @@ fn request_redraw(app_weak: &slint::Weak<AppWindow>) {
     }
 }
 
-fn update_tabs(s: &TerminalState, app_weak: &slint::Weak<AppWindow>) {
+fn update_tabs(s: &mut TerminalState, app_weak: &slint::Weak<AppWindow>) {
     let Some(app) = app_weak.upgrade() else { return };
     let active_idx = s.workspace_mgr.active_index();
     let tabs: Vec<TabInfo> = (0..s.workspace_mgr.workspace_count())
@@ -643,6 +665,23 @@ fn update_tabs(s: &TerminalState, app_weak: &slint::Weak<AppWindow>) {
         .collect();
     let model = std::rc::Rc::new(slint::VecModel::from(tabs));
     app.set_tabs(slint::ModelRc::from(model));
+
+    s.contributions
+        .set_builtin_workspace_sidebar(s.workspace_mgr.workspace_count(), active_idx);
+    let sidebar_items: Vec<SidebarItem> = s
+        .contributions
+        .sidebar_items()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, item)| SidebarItem {
+            title: item.title.into(),
+            active: item.active,
+            index: idx as i32,
+        })
+        .collect();
+    let sidebar_model = std::rc::Rc::new(slint::VecModel::from(sidebar_items));
+    app.set_sidebar_items(slint::ModelRc::from(sidebar_model));
+    app.set_sidebar_visible(s.workspace_mgr.workspace_count() > 1);
 }
 
 fn spawn_pane_slint(config: &Config, pane_id: PaneId, cols: u16, rows: u16) -> PaneState {
@@ -1429,7 +1468,7 @@ fn handle_dead_panes(state: &Rc<RefCell<TerminalState>>, app_weak: &slint::Weak<
     }
     // Re-layout surviving panes to fill the freed space
     resize_active_workspace_panes(&mut s);
-    update_tabs(&s, app_weak);
+    update_tabs(&mut s, app_weak);
 }
 
 // ---------------------------------------------------------------------------

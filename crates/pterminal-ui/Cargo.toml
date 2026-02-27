@@ -8,6 +8,7 @@ build = "build.rs"
 pterminal-core.workspace = true
 pterminal-render.workspace = true
 pterminal-ipc.workspace = true
+pterminal-plugin-api.workspace = true
 winit.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
