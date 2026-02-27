@@ -145,6 +145,38 @@ pub struct PluginRuntimeState {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TerminalTopology {
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceTopology>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceTopology {
+    pub id: u64,
+    pub name: String,
+    pub pane_ids: Vec<u64>,
+    pub active_pane_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneStateSnapshot {
+    pub pane_id: u64,
+    pub alive: bool,
+    pub title: String,
+    pub cwd: String,
+    pub rows: u16,
+    pub cols: u16,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneContentSnapshot {
+    pub pane_id: u64,
+    pub text: String,
+    pub truncated: bool,
+}
+
 pub fn build_activation_index(manifests: &[PluginManifest]) -> ActivationIndex {
     let mut index: ActivationIndex = BTreeMap::new();
     for manifest in manifests {

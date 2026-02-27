@@ -1,10 +1,12 @@
 use anyhow::{anyhow, Result};
 use pterminal_plugin_api::{
-    CommandContribution, Contributions, SidebarViewContribution, TabTypeContribution,
+    CommandContribution, Contributions, PaneContentSnapshot, PaneStateSnapshot, SidebarViewContribution,
+    TabTypeContribution, TerminalTopology,
 };
 use pterminal_plugin_host::{
     HostRequest, HostRequestPayload, HostResponse, HostResponsePayload, PluginHostRuntime,
 };
+use std::collections::HashSet;
 
 pub trait Plugin {
     fn activate(&mut self, ctx: &mut PluginContext) -> Result<()>;
@@ -167,5 +169,56 @@ impl<T: HostTransport> HostClient<T> {
             ));
         }
         Ok(response.payload)
+    }
+}
+
+pub trait TerminalSnapshotProvider {
+    fn topology(&self) -> Result<TerminalTopology>;
+    fn pane_states(&self) -> Result<Vec<PaneStateSnapshot>>;
+    fn pane_content(&self, pane_id: u64, max_lines: usize) -> Result<PaneContentSnapshot>;
+}
+
+pub struct TerminalIntrospectionApi<P: TerminalSnapshotProvider> {
+    provider: P,
+    permissions: HashSet<String>,
+    max_content_reads: u32,
+    content_reads: u32,
+}
+
+impl<P: TerminalSnapshotProvider> TerminalIntrospectionApi<P> {
+    pub fn new(provider: P, permissions: Vec<String>, max_content_reads: u32) -> Self {
+        Self {
+            provider,
+            permissions: permissions.into_iter().collect(),
+            max_content_reads: max_content_reads.max(1),
+            content_reads: 0,
+        }
+    }
+
+    pub fn topology(&mut self) -> Result<TerminalTopology> {
+        self.require_permission("terminal.topology.read")?;
+        self.provider.topology()
+    }
+
+    pub fn pane_states(&mut self) -> Result<Vec<PaneStateSnapshot>> {
+        self.require_permission("terminal.pane.state.read")?;
+        self.provider.pane_states()
+    }
+
+    pub fn pane_content(&mut self, pane_id: u64, max_lines: usize) -> Result<PaneContentSnapshot> {
+        self.require_permission("terminal.pane.content.read")?;
+        if self.content_reads >= self.max_content_reads {
+            return Err(anyhow!("pane content read rate limit exceeded"));
+        }
+        self.content_reads = self.content_reads.saturating_add(1);
+        let bounded_lines = max_lines.clamp(1, 2000);
+        self.provider.pane_content(pane_id, bounded_lines)
+    }
+
+    fn require_permission(&self, permission: &str) -> Result<()> {
+        if self.permissions.contains(permission) {
+            return Ok(());
+        }
+        Err(anyhow!("missing required permission: {permission}"))
     }
 }
