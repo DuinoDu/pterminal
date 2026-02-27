@@ -92,12 +92,13 @@ impl PtyHandle {
             })?;
         let writer_waker = writer_thread.thread().clone();
 
-        // Spawn reader thread
+        // Spawn reader thread with 1MB buffer for high throughput
         let mut reader = pair.master.try_clone_reader()?;
         let reader_thread = std::thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
-                let mut buf = [0u8; 8192];
+                // 1MB heap-allocated buffer for better I/O throughput (vs 8KB stack)
+                let mut buf = vec![0u8; 1024 * 1024];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,

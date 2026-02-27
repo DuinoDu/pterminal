@@ -170,6 +170,8 @@ struct TerminalState {
     ipc_rx: Receiver<IpcEnvelope>,
     _ipc_server: Option<IpcServer>,
     ipc_socket_path: PathBuf,
+    /// Frame rate limiting - last render time
+    last_render_time: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +256,7 @@ impl SlintApp {
             ipc_rx,
             _ipc_server: ipc_server,
             ipc_socket_path,
+            last_render_time: Instant::now() - Duration::from_millis(100),
         }));
 
         // 4. Rendering notifier ─ runs on RenderingSetup and BeforeRendering
@@ -552,6 +555,8 @@ impl SlintApp {
         }
 
         // 9. Timer for polling dirty flags & dead panes
+        // Frame rate limiting: 8ms minimum interval (~120fps max)
+        const MIN_FRAME_INTERVAL_MS: u64 = 8;
         let poll_timer = slint::Timer::default();
         {
             let state = state.clone();
@@ -568,12 +573,19 @@ impl SlintApp {
                             .map_or(false, |ps| ps.dirty.load(Ordering::Relaxed))
                     });
                     let any_dead = s.pane_states.values().any(|ps| !ps.pty.is_alive());
+
+                    // Frame rate limiting: skip redraw if too recent
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(s.last_render_time);
+                    let should_render = elapsed >= Duration::from_millis(MIN_FRAME_INTERVAL_MS);
                     drop(s);
 
-                    if any_dirty || any_dead {
-                        if any_dead {
-                            handle_dead_panes(&state, &app_weak2);
-                        }
+                    if any_dead {
+                        handle_dead_panes(&state, &app_weak2);
+                    }
+
+                    // Only request redraw if dirty AND enough time has passed
+                    if (any_dirty || any_dead) && should_render {
                         request_redraw(&app_weak2);
                     }
 
@@ -1253,9 +1265,14 @@ fn render_frame(s: &mut TerminalState, theme: &Arc<Theme>, app_weak: &slint::Wea
             if content_dirty || cursor_changed || selection_active {
                 let cursor_pos;
                 if content_dirty || ps.render_grid.is_empty() {
+                    // Use timeout to avoid blocking main thread during high throughput
                     let (delta, cursor) = ps
                         .emulator
-                        .extract_grid_delta_with_cursor_into(theme, &mut ps.render_grid);
+                        .extract_grid_delta_with_cursor_into_timeout(
+                            theme,
+                            &mut ps.render_grid,
+                            Some(Duration::from_millis(2)),
+                        );
                     cursor_pos = cursor;
                     ps.render_dirty_rows.clear();
                     if delta.full {
@@ -1328,6 +1345,9 @@ fn render_frame(s: &mut TerminalState, theme: &Arc<Theme>, app_weak: &slint::Wea
             app.set_terminal_texture(img);
         }
     }
+
+    // Record render time for frame rate limiting
+    s.last_render_time = Instant::now();
 }
 
 // ---------------------------------------------------------------------------

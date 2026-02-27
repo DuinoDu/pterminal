@@ -14,7 +14,8 @@ use crate::terminal::spsc;
 
 const PARSER_CONTROL_QUEUE_DEPTH: usize = 512;
 const PARSER_INPUT_QUEUE_DEPTH: usize = 2048;
-const PARSER_IDLE_PARK_MS: u64 = 5;
+// Reduced from 5ms to 1ms for lower latency during high-throughput scenarios
+const PARSER_IDLE_PARK_MS: u64 = 1;
 
 /// Event listener that collects events
 #[derive(Clone)]
@@ -258,6 +259,17 @@ impl TerminalEmulator {
         theme: &Arc<Theme>,
         out: &mut Vec<GridLine>,
     ) -> (GridDelta, (u16, u16)) {
+        self.extract_grid_delta_with_cursor_into_timeout(theme, out, None)
+    }
+
+    /// Non-blocking version with optional timeout (Strategy 2: Async rendering)
+    /// Returns cached data if parser is busy, avoiding main thread blocking.
+    pub fn extract_grid_delta_with_cursor_into_timeout(
+        &self,
+        theme: &Arc<Theme>,
+        out: &mut Vec<GridLine>,
+        timeout: Option<Duration>,
+    ) -> (GridDelta, (u16, u16)) {
         let (tx, rx) = mpsc::channel();
         if send_control_blocking(
             &self.control_tx,
@@ -272,7 +284,14 @@ impl TerminalEmulator {
             return (GridDelta::default(), (0, 0));
         }
 
-        let Ok(reply) = rx.recv() else {
+        // Use timeout to avoid blocking main thread during high-throughput
+        let reply_result = match timeout {
+            Some(t) => rx.recv_timeout(t),
+            None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+
+        let Ok(reply) = reply_result else {
+            // Parser busy - return empty delta, keep existing cached grid
             return (GridDelta::default(), (0, 0));
         };
 

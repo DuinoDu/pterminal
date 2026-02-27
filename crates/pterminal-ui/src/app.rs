@@ -26,6 +26,11 @@ use pterminal_ipc::{IpcServer, JsonRpcRequest, JsonRpcResponse};
 use pterminal_render::text::PixelRect;
 use pterminal_render::Renderer;
 
+/// Minimum frame interval for rate limiting (8ms ≈ 120fps max)
+const MIN_FRAME_INTERVAL_MS: u64 = 8;
+/// Maximum pending input events before forcing a render
+const MAX_PENDING_INPUT_EVENTS: u32 = 100;
+
 /// Text selection range in grid coordinates
 #[derive(Clone, Copy, PartialEq)]
 struct Selection {
@@ -49,7 +54,6 @@ struct PaneState {
     emulator: TerminalEmulator,
     pty: PtyHandle,
     dirty: Arc<AtomicBool>,
-    redraw_queued: Arc<AtomicBool>,
     render_grid: Vec<pterminal_core::terminal::GridLine>,
     render_dirty_rows: Vec<usize>,
     /// Last cursor visible state used in rendering (for blink-only updates)
@@ -94,6 +98,10 @@ struct RunningState {
     _ipc_server: Option<IpcServer>,
     ipc_socket_path: PathBuf,
     split_drag: Option<SplitDrag>,
+    // Frame rate limiting (Strategy 1)
+    last_render_time: Instant,
+    /// Pending input events to process before rendering (Strategy 3)
+    pending_input_events: u32,
 }
 
 /// Right-click context menu
@@ -404,15 +412,12 @@ impl AppHandler {
         let shell = config.shell();
         let cwd = config.working_directory();
         let dirty = Arc::new(AtomicBool::new(true));
-        let redraw_queued = Arc::new(AtomicBool::new(false));
 
         let mut emulator = TerminalEmulator::new(cols, rows);
         let parser_handle = emulator
             .take_parser_handle()
             .expect("terminal parser handle already taken");
-        let window_for_redraw = window.clone();
         let dirty_for_pty = Arc::clone(&dirty);
-        let redraw_queued_for_pty = Arc::clone(&redraw_queued);
 
         let pty = PtyHandle::spawn(
             &shell,
@@ -421,17 +426,16 @@ impl AppHandler {
             rows,
             parser_handle,
             move || {
+                // Only set dirty flag - do NOT call request_redraw() here!
+                // The main thread's about_to_wait() will detect dirty state
+                // and schedule redraws at a controlled rate.
+                // This avoids flooding the event loop with cross-thread wakeups.
                 dirty_for_pty.store(true, Ordering::Release);
-                // Coalesce cross-thread redraw wakeups with a separate flag.
-                // Using `dirty` for this can lose wakeups when the UI clears it
-                // after having already consumed an older frame snapshot.
-                if !redraw_queued_for_pty.swap(true, Ordering::AcqRel) {
-                    window_for_redraw.request_redraw();
-                }
             },
             {
                 let window_exit = window.clone();
                 move || {
+                    // Only request redraw on exit - this is rare and important
                     window_exit.request_redraw();
                 }
             },
@@ -444,7 +448,6 @@ impl AppHandler {
             emulator,
             pty,
             dirty,
-            redraw_queued,
             render_grid: Vec::new(),
             render_dirty_rows: Vec::new(),
             last_cursor_visible: true,
@@ -880,6 +883,9 @@ impl ApplicationHandler for AppHandler {
             _ipc_server: ipc_server,
             ipc_socket_path,
             split_drag: None,
+            // Frame rate limiting - start in the past to allow immediate first frame
+            last_render_time: Instant::now() - Duration::from_millis(100),
+            pending_input_events: 0,
         };
 
         Self::update_title(&running);
@@ -955,6 +961,9 @@ impl ApplicationHandler for AppHandler {
                 button: MouseButton::Left,
                 ..
             } => {
+                // Strategy 3: Track input events for priority handling
+                state.pending_input_events = state.pending_input_events.saturating_add(1);
+
                 let scale = state.scale_factor as f32;
                 let (phys_x, phys_y) = Self::mouse_physical(state);
 
@@ -1136,6 +1145,9 @@ impl ApplicationHandler for AppHandler {
                 button: MouseButton::Right,
                 ..
             } => {
+                // Strategy 3: Track input events for priority handling
+                state.pending_input_events = state.pending_input_events.saturating_add(1);
+
                 if btn_state == ElementState::Pressed {
                     let (phys_x, phys_y) = Self::mouse_physical(state);
                     if let Some(clicked_pane) = Self::pane_at_pixel(state, phys_x, phys_y) {
@@ -1162,6 +1174,9 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                // Strategy 3: Track input events for priority handling
+                state.pending_input_events = state.pending_input_events.saturating_add(1);
+
                 let prev = state.last_mouse_pos;
                 state.last_mouse_pos = (position.x, position.y);
                 if let Some(drag) = &state.split_drag {
@@ -1220,6 +1235,9 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
+                // Strategy 3: Track input events for priority handling
+                state.pending_input_events = state.pending_input_events.saturating_add(1);
+
                 if event.state != ElementState::Pressed {
                     return;
                 }
@@ -1471,6 +1489,24 @@ impl ApplicationHandler for AppHandler {
             }
 
             WindowEvent::RedrawRequested => {
+                // Strategy 1: Frame rate limiting
+                // Skip this frame if we rendered too recently (unless forced by input backlog)
+                let now = Instant::now();
+                let elapsed_since_render = now.duration_since(state.last_render_time);
+                let min_interval = Duration::from_millis(MIN_FRAME_INTERVAL_MS);
+
+                if elapsed_since_render < min_interval && state.pending_input_events < MAX_PENDING_INPUT_EVENTS {
+                    // Schedule next frame at the appropriate time
+                    let wait_time = min_interval - elapsed_since_render;
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                        now + wait_time,
+                    ));
+                    return;
+                }
+
+                // Reset pending input counter since we're rendering now
+                state.pending_input_events = 0;
+
                 let t_frame = Instant::now();
                 let theme = &self.app.theme;
                 let scale = state.scale_factor as f32;
@@ -1564,9 +1600,6 @@ impl ApplicationHandler for AppHandler {
                     let px_rect = Self::pane_to_pixel_rect(pane_rect, w, h, scale, tab_bar_h);
 
                     if let Some(ps) = state.pane_states.get_mut(pane_id) {
-                        // We are consuming a queued redraw for this pane; clear early so
-                        // new PTY output during this frame can enqueue another redraw.
-                        ps.redraw_queued.store(false, Ordering::Release);
                         let show_cursor = *pane_id == active_pane;
                         let content_dirty = ps.dirty.load(Ordering::Acquire);
                         let cursor_changed = ps.last_cursor_visible != show_cursor;
@@ -1575,10 +1608,13 @@ impl ApplicationHandler for AppHandler {
                         if content_dirty || cursor_changed || selection_active {
                             let cursor_pos;
                             if content_dirty || ps.render_grid.is_empty() {
+                                // Strategy 2: Use timeout to avoid blocking main thread
+                                // 2ms timeout ensures we don't block too long during high throughput
                                 let (delta, cursor) =
-                                    ps.emulator.extract_grid_delta_with_cursor_into(
+                                    ps.emulator.extract_grid_delta_with_cursor_into_timeout(
                                         theme,
                                         &mut ps.render_grid,
+                                        Some(Duration::from_millis(2)),
                                     );
                                 cursor_pos = cursor;
                                 ps.render_dirty_rows.clear();
@@ -1671,6 +1707,9 @@ impl ApplicationHandler for AppHandler {
                     }
                 }
 
+                // Record render time for frame rate limiting
+                state.last_render_time = Instant::now();
+
                 // FPS counter in title
                 state.frame_count += 1;
                 let fps_elapsed = state.fps_timer.elapsed();
@@ -1700,14 +1739,28 @@ impl ApplicationHandler for AppHandler {
                     .get(pid)
                     .map_or(false, |ps| ps.dirty.load(Ordering::Relaxed))
             });
+
+            // Strategy 1: Frame rate limiting with proper scheduling
+            let now = Instant::now();
+            let elapsed = now.duration_since(state.last_render_time);
+            let min_interval = Duration::from_millis(MIN_FRAME_INTERVAL_MS);
+
             if any_dirty {
-                state.window.request_redraw();
+                if elapsed >= min_interval {
+                    // Enough time has passed, render now
+                    state.window.request_redraw();
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                } else {
+                    // Schedule render at next frame boundary
+                    let next_frame = state.last_render_time + min_interval;
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next_frame));
+                }
+            } else {
+                // No dirty content - wait for events with a reasonable timeout
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                    now + Duration::from_millis(16),
+                ));
             }
-            // Short safety-net timeout: ensures rendering even if cross-thread
-            // request_redraw doesn't immediately wake the macOS run loop.
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(4),
-            ));
         }
     }
 }

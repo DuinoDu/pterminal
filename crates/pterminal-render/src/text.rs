@@ -30,8 +30,8 @@ pub struct PixelRect {
 /// Per-line render buffer with change detection
 struct LineBuffer {
     buffer: Buffer,
-    text_hash: u64,
-    bg_hash: u64,
+    /// Generation counter for tracking changes (replaces hash-based detection)
+    generation: u64,
     is_blank: bool,
 }
 
@@ -51,6 +51,8 @@ struct PaneBuffer {
     /// Reusable scratch buffers to avoid per-line allocation
     scratch_text: String,
     scratch_spans: Vec<RichSpan>,
+    /// Global generation counter for change tracking
+    generation: u64,
 }
 
 /// A horizontal run of cells sharing the same background color
@@ -123,8 +125,8 @@ impl TextRenderer {
         db.set_sans_serif_family("PingFang SC");
         db.set_serif_family("PingFang SC");
         // Use zh locale so CJK fallback picks PingFang SC (黑体) not STSong (宋体)
-        let font_system = FontSystem::new_with_locale_and_db("zh-Hans".to_string(), db);
-        let swash_cache = SwashCache::new();
+        let mut font_system = FontSystem::new_with_locale_and_db("zh-Hans".to_string(), db);
+        let mut swash_cache = SwashCache::new();
         let cache = Cache::new(device);
         let mut atlas = TextAtlas::new(device, queue, &cache, format);
         let glyphon_renderer =
@@ -132,6 +134,17 @@ impl TextRenderer {
         let overlay_renderer =
             GlyphonTextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         let viewport = Viewport::new(device, &cache);
+
+        // Preload ASCII glyphs (0x20-0x7E) to avoid first-frame rasterization stalls
+        Self::preload_ascii_glyphs(
+            &mut font_system,
+            &mut swash_cache,
+            &mut atlas,
+            device,
+            queue,
+            scaled_font_size,
+            scaled_line_height,
+        );
 
         Self {
             font_system,
@@ -150,6 +163,60 @@ impl TextRenderer {
             context_menu: None,
             atlas_trim_frames: 0,
         }
+    }
+
+    /// Preload ASCII printable characters into the glyph atlas
+    fn preload_ascii_glyphs(
+        font_system: &mut FontSystem,
+        swash_cache: &mut SwashCache,
+        atlas: &mut TextAtlas,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        font_size: f32,
+        line_height: f32,
+    ) {
+        // ASCII printable range: 0x20 (space) to 0x7E (~)
+        let ascii: String = (0x20u8..=0x7Eu8).map(|b| b as char).collect();
+        let metrics = Metrics::new(font_size, line_height);
+        let mut buffer = Buffer::new(font_system, metrics);
+        buffer.set_size(font_system, Some(2000.0), Some(line_height));
+        let attrs = Attrs::new().family(Family::Monospace);
+        buffer.set_text(font_system, &ascii, &attrs, Shaping::Basic, None);
+        buffer.shape_until_scroll(font_system, false);
+
+        // Create a temporary renderer to force glyph rasterization
+        let cache = Cache::new(device);
+        let viewport = Viewport::new(device, &cache);
+        let resolution = Resolution { width: 2000, height: 100 };
+        let mut temp_viewport = viewport;
+        temp_viewport.update(queue, resolution);
+
+        let text_area = TextArea {
+            buffer: &buffer,
+            left: 0.0,
+            top: 0.0,
+            scale: 1.0,
+            bounds: TextBounds {
+                left: 0,
+                top: 0,
+                right: 2000,
+                bottom: 100,
+            },
+            default_color: Color::rgb(255, 255, 255),
+            custom_glyphs: &[],
+        };
+
+        let mut temp_renderer =
+            GlyphonTextRenderer::new(atlas, device, wgpu::MultisampleState::default(), None);
+        let _ = temp_renderer.prepare(
+            device,
+            queue,
+            font_system,
+            atlas,
+            &temp_viewport,
+            vec![text_area],
+            swash_cache,
+        );
     }
 
     pub fn resize(&mut self, _queue: &wgpu::Queue, width: u32, height: u32) {
@@ -199,6 +266,7 @@ impl TextRenderer {
                 last_line_layout_key: None,
                 scratch_text: String::with_capacity(256),
                 scratch_spans: Vec::with_capacity(16),
+                generation: 0,
             });
 
         // Ensure correct number of line buffers
@@ -206,8 +274,7 @@ impl TextRenderer {
         while pb.lines.len() < grid.len() {
             pb.lines.push(LineBuffer {
                 buffer: Buffer::new(&mut self.font_system, metrics),
-                text_hash: u64::MAX,
-                bg_hash: u64::MAX,
+                generation: 0,
                 is_blank: true,
             });
         }
@@ -233,53 +300,53 @@ impl TextRenderer {
         let default_attrs = Attrs::new().family(Family::Monospace);
         let bg_full_rebuild = line_count_changed || pb.last_default_bg != default_bg;
         let mut bg_dirty_rows: Vec<usize> = Vec::new();
-        let mut any_bg_dirty = bg_full_rebuild;
+
+        // Use native damage tracking from alacritty_terminal - no hash computation needed
         if line_count_changed {
             for (row_idx, line) in grid.iter().enumerate() {
-                update_line_buffer(
+                update_line_buffer_no_hash(
                     &mut self.font_system,
                     pb,
                     row_idx,
                     line,
                     &default_attrs,
-                    &mut any_bg_dirty,
-                    &mut bg_dirty_rows,
                 );
+                bg_dirty_rows.push(row_idx);
             }
         } else if let Some(dirty_rows) = dirty_rows {
+            // Use dirty_rows from native damage tracking directly
             for &row_idx in dirty_rows {
                 if let Some(line) = grid.get(row_idx) {
-                    update_line_buffer(
+                    update_line_buffer_no_hash(
                         &mut self.font_system,
                         pb,
                         row_idx,
                         line,
                         &default_attrs,
-                        &mut any_bg_dirty,
-                        &mut bg_dirty_rows,
                     );
+                    bg_dirty_rows.push(row_idx);
                 }
             }
         } else {
+            // Full update when no dirty info available
             for (row_idx, line) in grid.iter().enumerate() {
-                update_line_buffer(
+                update_line_buffer_no_hash(
                     &mut self.font_system,
                     pb,
                     row_idx,
                     line,
                     &default_attrs,
-                    &mut any_bg_dirty,
-                    &mut bg_dirty_rows,
                 );
+                bg_dirty_rows.push(row_idx);
             }
         }
 
+        let any_bg_dirty = bg_full_rebuild || !bg_dirty_rows.is_empty();
         if any_bg_dirty {
-            if bg_full_rebuild || bg_dirty_rows.len() > grid.len() / 2 {
-                // Full rebuild when > half the rows changed or grid resized.
+            // Always use incremental update - no 50% threshold
+            if bg_full_rebuild {
                 rebuild_content_bg_spans(&mut pb.content_bg_spans, grid, default_bg);
             } else {
-                // Incremental: only update spans for dirty rows.
                 incremental_update_bg_spans(
                     &mut pb.content_bg_spans,
                     grid,
@@ -446,7 +513,8 @@ impl TextRenderer {
     pub fn post_render(&mut self) {
         self.atlas_trim_frames = self.atlas_trim_frames.wrapping_add(1);
         // Trimming every frame causes avoidable CPU work and glyph churn.
-        if self.atlas_trim_frames >= 120 {
+        // Increased from 120 to 300 frames to reduce atlas thrashing.
+        if self.atlas_trim_frames >= 300 {
             self.atlas.trim();
             self.atlas_trim_frames = 0;
         }
@@ -757,38 +825,28 @@ impl TextRenderer {
     }
 }
 
-fn update_line_buffer(
+/// Update line buffer without hash computation - relies on native damage tracking
+fn update_line_buffer_no_hash(
     font_system: &mut FontSystem,
     pb: &mut PaneBuffer,
     row_idx: usize,
     line: &GridLine,
     default_attrs: &Attrs<'static>,
-    any_bg_dirty: &mut bool,
-    bg_dirty_rows: &mut Vec<usize>,
 ) {
-    let lb = &mut pb.lines[row_idx];
-
-    // Single pass over cells for both text and bg hashes.
-    let (text_hash, bg_hash) = hash_line_combined(line);
-    if bg_hash != lb.bg_hash {
-        lb.bg_hash = bg_hash;
-        *any_bg_dirty = true;
-        bg_dirty_rows.push(row_idx);
-    }
-
-    if text_hash == lb.text_hash {
-        return;
-    }
-    lb.text_hash = text_hash;
+    // Increment generation to mark this line as updated
+    pb.generation = pb.generation.wrapping_add(1);
+    let current_gen = pb.generation;
 
     // Reuse pane-level scratch buffers to avoid per-line allocation.
-    // build_line_rich_text_into also reports blank/ASCII status to avoid extra passes.
     let text = &mut pb.scratch_text;
     let spans = &mut pb.scratch_spans;
     let line_info = build_line_rich_text_into(line, text, spans);
 
+    let lb = &mut pb.lines[row_idx];
+    lb.generation = current_gen;
+
     if line_info.is_blank {
-        pb.lines[row_idx].is_blank = true;
+        lb.is_blank = true;
         return;
     }
 
@@ -798,8 +856,6 @@ fn update_line_buffer(
         Shaping::Advanced
     };
 
-    // Re-borrow lb after scratch buffer usage (scratch lives on pb).
-    let lb = &mut pb.lines[row_idx];
     lb.is_blank = false;
     if spans.len() == 1 {
         let span = &spans[0];
@@ -930,27 +986,6 @@ fn rebuild_selection_bg_spans(
             color,
         });
     }
-}
-
-/// Compute text hash and bg hash in a single pass over cells.
-fn hash_line_combined(line: &GridLine) -> (u64, u64) {
-    use std::hash::{Hash, Hasher};
-    let mut text_h = ahash::AHasher::default();
-    let mut bg_h = ahash::AHasher::default();
-    line.cells.len().hash(&mut bg_h);
-    for cell in line.cells.iter() {
-        cell.c.hash(&mut text_h);
-        cell.fg.r.hash(&mut text_h);
-        cell.fg.g.hash(&mut text_h);
-        cell.fg.b.hash(&mut text_h);
-        cell.bold.hash(&mut text_h);
-        cell.italic.hash(&mut text_h);
-        cell.wide_spacer.hash(&mut text_h);
-        cell.bg.r.hash(&mut bg_h);
-        cell.bg.g.hash(&mut bg_h);
-        cell.bg.b.hash(&mut bg_h);
-    }
-    (text_h.finish(), bg_h.finish())
 }
 
 /// Info produced by build_line_rich_text_into alongside the text/spans.
