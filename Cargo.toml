@@ -78,7 +78,7 @@ wgpu.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
-tokio.workspace = true
+clap.workspace = true
 
 [profile.release]
 opt-level = 3

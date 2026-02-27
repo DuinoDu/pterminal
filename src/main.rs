@@ -1,9 +1,19 @@
 use anyhow::Result;
+use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use pterminal_core::Config;
-use pterminal_ui::SlintApp;
+use pterminal_ui::{App, SlintApp};
+
+#[derive(Parser, Debug)]
+#[command(name = "pterminal")]
+#[command(about = "A GPU-accelerated terminal emulator")]
+struct Args {
+    /// Use raw winit backend instead of Slint
+    #[arg(long)]
+    raw: bool,
+}
 
 fn main() -> Result<()> {
     // Initialize logging
@@ -21,7 +31,15 @@ fn main() -> Result<()> {
         Config::default()
     });
 
-    // Run the Slint-based application
-    let app = SlintApp::new(config);
-    app.run()
+    let args = Args::parse();
+
+    if args.raw {
+        // Use raw winit backend
+        let app = App::new(config);
+        app.run()
+    } else {
+        // Use Slint backend (default)
+        let app = SlintApp::new(config);
+        app.run()
+    }
 }
