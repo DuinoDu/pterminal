@@ -6,6 +6,7 @@ members = [
     "crates/pterminal-ui",
     "crates/pterminal-ipc",
     "crates/pterminal-plugin-api",
+    "crates/pterminal-plugin-host",
     "cli",
     ".",
 ]
@@ -59,6 +60,7 @@ pterminal-render = { path = "crates/pterminal-render" }
 pterminal-ui = { path = "crates/pterminal-ui" }
 pterminal-ipc = { path = "crates/pterminal-ipc" }
 pterminal-plugin-api = { path = "crates/pterminal-plugin-api" }
+pterminal-plugin-host = { path = "crates/pterminal-plugin-host" }
 
 [package]
 name = "pterminal"
