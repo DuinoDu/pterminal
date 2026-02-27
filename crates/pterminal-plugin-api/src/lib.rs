@@ -2,6 +2,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+mod manifest_loader;
+
+pub use manifest_loader::{
+    discover_plugin_catalog, DiscoveredPlugin, ManifestDiagnostic, PluginCatalog,
+};
+
 pub type PluginId = String;
 pub type ActivationIndex = BTreeMap<ActivationEvent, Vec<PluginId>>;
 
