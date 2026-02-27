@@ -1,0 +1,9 @@
+[package]
+name = "pterminal-sdk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+pterminal-plugin-api.workspace = true
+pterminal-plugin-host.workspace = true
