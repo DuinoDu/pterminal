@@ -15,7 +15,10 @@ tracing.workspace = true
 anyhow.workspace = true
 arboard.workspace = true
 serde_json.workspace = true
-slint = { version = "1.15", features = ["unstable-wgpu-28"] }
+slint = { version = "1.15", features = ["unstable-wgpu-28", "unstable-winit-030"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
 
 [build-dependencies]
 slint-build = "1.15"

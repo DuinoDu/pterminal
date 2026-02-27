@@ -71,6 +71,39 @@ fn detect_display_scale() -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// macOS titlebar customization
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+unsafe fn configure_macos_titlebar(ns_view: *mut std::ffi::c_void) {
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::msg_send;
+
+    let view = ns_view as *mut AnyObject;
+    if view.is_null() {
+        return;
+    }
+    let window: *mut AnyObject = msg_send![view, window];
+    if window.is_null() {
+        return;
+    }
+
+    // titlebarAppearsTransparent = YES
+    let _: () = msg_send![window, setTitlebarAppearsTransparent: Bool::YES];
+    // Set window background color to match terminal (#272935)
+    let ns_color_class = objc2::runtime::AnyClass::get(c"NSColor").unwrap();
+    let bg_color: *mut AnyObject = msg_send![
+        ns_color_class,
+        colorWithRed: 0.153_f64
+        green: 0.161_f64
+        blue: 0.208_f64
+        alpha: 1.0_f64
+    ];
+    let _: () = msg_send![window, setBackgroundColor: bg_color];
+}
+
+// ---------------------------------------------------------------------------
 // Supporting types (mirrored from app.rs for the Slint backend)
 // ---------------------------------------------------------------------------
 
@@ -553,7 +586,24 @@ impl SlintApp {
         // 10. Initial tab bar state
         update_tabs(&state.borrow(), &app_weak);
 
-        // 11. Focus terminal and run
+        // 11. Customize macOS titlebar to blend with terminal background
+        #[cfg(target_os = "macos")]
+        {
+            use slint::winit_030::WinitWindowAccessor;
+            app.window().with_winit_window(|winit_win| {
+                use winit::raw_window_handle::HasWindowHandle;
+                if let Ok(handle) = winit_win.window_handle() {
+                    let raw = handle.as_ref();
+                    if let winit::raw_window_handle::RawWindowHandle::AppKit(appkit) = raw {
+                        unsafe {
+                            configure_macos_titlebar(appkit.ns_view.as_ptr() as *mut std::ffi::c_void);
+                        }
+                    }
+                }
+            });
+        }
+
+        // 12. Focus terminal and run
         app.invoke_focus_terminal();
         app.run()?;
         Ok(())
